@@ -11,7 +11,7 @@ def test_exports_current_and_per_run_csv_without_separator_rows(tmp_path):
             "id": "1",
             "site": "indeed",
             "job_url": "https://example.com/1",
-            "title": "Backend Engineer",
+            "title": "Junior Backend Engineer",
             "company": "Example",
             "location": "Remote",
             "is_remote": True,
@@ -35,7 +35,7 @@ def test_exports_current_and_per_run_csv_without_separator_rows(tmp_path):
         rows = list(csv.DictReader(csv_file))
     assert list(rows[0]) == EXPORT_COLUMNS
     assert len(rows) == 1
-    assert rows[0]["title"] == "Backend Engineer"
+    assert rows[0]["title"] == "Junior Backend Engineer"
     assert rows[0]["compensation"] == "USD 90000-110000/yearly"
     assert "Jobs Scraped at" not in current_path.read_text()
 

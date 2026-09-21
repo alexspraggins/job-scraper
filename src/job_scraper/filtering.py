@@ -9,6 +9,12 @@ import pandas as pd
 from . import config
 
 
+LEVEL_ONE_PATTERN = re.compile(r"(?<![a-z0-9])(?:i|1)(?![a-z0-9])")
+HIGHER_LEVEL_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:ii|iii|iv|v|vi|vii|viii|ix|x|[2-9]|10)(?![a-z0-9])"
+)
+
+
 @dataclass(frozen=True)
 class FilterStats:
     raw: int
@@ -55,6 +61,9 @@ def classify_title(
         if phrase_matches(normalized_title, term):
             return TitleMatch(False, f"excluded:{normalize_text(term)}", None, (), "excluded")
 
+    if HIGHER_LEVEL_PATTERN.search(normalized_title):
+        return TitleMatch(False, "excluded:level 2+", None, (), "excluded")
+
     matches: list[tuple[str, str]] = []
     for family, terms in role_terms.items():
         for term in terms:
@@ -64,9 +73,10 @@ def classify_title(
     if not matches:
         return TitleMatch(False, "unmatched", None, (), "unknown")
 
-    seniority = "entry" if any(
+    has_entry_marker = LEVEL_ONE_PATTERN.search(normalized_title) is not None or any(
         phrase_matches(normalized_title, term) for term in config.ENTRY_LEVEL_TERMS
-    ) else "unspecified"
+    )
+    seniority = "entry" if has_entry_marker else "unspecified"
     primary_family = matches[0][0]
     matched_terms = tuple(dict.fromkeys(term for _, term in matches))
     return TitleMatch(True, "accepted", primary_family, matched_terms, seniority)

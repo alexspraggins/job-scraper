@@ -185,9 +185,13 @@ Titles are normalized before matching, including punctuation, spacing, and
 hyphen variants. Matching uses phrase boundaries so short terms such as `C`,
 `C++`, and `SRE` do not accidentally match parts of unrelated words.
 
-Listings with seniority terms such as `senior`, `staff`, `principal`, `lead`,
-`manager`, `director`, or `architect` are excluded. Accepted jobs receive a
-role family, matched terms, and an `entry` or `unspecified` seniority label.
+Listings do not need an explicit early-career marker. Unnumbered titles such as
+`Software Engineer` are accepted when they match a configured role. Titles with
+standalone levels II-X or 2-10 are excluded, along with `mid-level`,
+`intermediate`, `experienced`, and seniority terms such as `senior`, `staff`,
+`principal`, `lead`, `manager`, `director`, or `architect`. Existing database
+records are reclassified before export, so ineligible titles are retained for
+history but omitted from CSV files.
 
 Each run prints raw, accepted, excluded, unmatched, duplicate, new, and error
 counts. A failure from one source or query does not discard successful results

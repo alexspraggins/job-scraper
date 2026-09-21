@@ -60,7 +60,7 @@ def test_repeated_cycle_creates_no_duplicate_canonical_job(tmp_path):
                     "id": "1",
                     "site": "indeed",
                     "job_url": "https://example.com/1",
-                    "title": "Software Developer",
+                    "title": "Associate Software Developer",
                     "company": "Example",
                     "location": "Boston, MA",
                 }
@@ -93,7 +93,7 @@ def test_cli_status_list_and_export(tmp_path, capsys):
             "id": "1",
             "site": "indeed",
             "job_url": "https://example.com/1",
-            "title": "Software Engineer",
+            "title": "Software Engineer I",
             "company": "Example",
             "location": "Remote",
             "role_family": "core_software",
@@ -110,7 +110,7 @@ def test_cli_status_list_and_export(tmp_path, capsys):
     assert main([*base, "export"]) == 0
     output = capsys.readouterr().out
     assert "marked saved" in output
-    assert "Software Engineer" in output
+    assert "Software Engineer I" in output
     assert (exports / "current_jobs.csv").exists()
 
 

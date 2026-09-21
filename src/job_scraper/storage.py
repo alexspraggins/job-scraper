@@ -12,10 +12,10 @@ import sqlite3
 from typing import Iterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .filtering import normalize_text
+from .filtering import classify_title, normalize_text
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 VALID_STATUSES = ("new", "reviewed", "saved", "applied", "rejected")
 TRACKING_QUERY_KEYS = {
     "ref",
@@ -125,6 +125,8 @@ class JobStore:
                     is_remote INTEGER,
                     role_family TEXT NOT NULL,
                     seniority TEXT NOT NULL,
+                    eligible INTEGER NOT NULL DEFAULT 1,
+                    eligibility_reason TEXT NOT NULL DEFAULT 'accepted',
                     status TEXT NOT NULL DEFAULT 'new'
                         CHECK (status IN ('new', 'reviewed', 'saved', 'applied', 'rejected')),
                     notes TEXT NOT NULL DEFAULT '',
@@ -209,6 +211,20 @@ class JobStore:
                 CREATE INDEX IF NOT EXISTS idx_attempts_run ON scrape_attempts(run_id);
                 """
             )
+            job_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+            if "eligible" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN eligible INTEGER NOT NULL DEFAULT 1"
+                )
+            if "eligibility_reason" not in job_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE jobs ADD COLUMN eligibility_reason TEXT
+                    NOT NULL DEFAULT 'accepted'
+                    """
+                )
             connection.execute(
                 """
                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)
@@ -344,8 +360,9 @@ class JobStore:
                     INSERT INTO jobs(
                         fingerprint, title, normalized_title, company, normalized_company,
                         location, normalized_location, is_remote, role_family, seniority,
-                        date_posted, first_seen_at, last_seen_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        eligible, eligibility_reason, date_posted, first_seen_at,
+                        last_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'accepted', ?, ?, ?, ?)
                     """,
                     (
                         fingerprint,
@@ -468,6 +485,36 @@ class JobStore:
                 (job_id, job["status"], new_status, note, now),
             )
 
+    def reclassify_jobs(self) -> tuple[int, int]:
+        """Reapply current title rules without deleting jobs or workflow history."""
+        eligible_count = 0
+        ineligible_count = 0
+        now = utc_now()
+        with self.connect() as connection:
+            jobs = connection.execute("SELECT id, title FROM jobs").fetchall()
+            for job in jobs:
+                decision = classify_title(job["title"])
+                if decision.accepted:
+                    eligible_count += 1
+                    connection.execute(
+                        """
+                        UPDATE jobs SET eligible = 1, eligibility_reason = 'accepted',
+                            role_family = ?, seniority = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (decision.role_family, decision.seniority, now, job["id"]),
+                    )
+                else:
+                    ineligible_count += 1
+                    connection.execute(
+                        """
+                        UPDATE jobs SET eligible = 0, eligibility_reason = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (decision.reason, now, job["id"]),
+                    )
+        return eligible_count, ineligible_count
+
     def list_jobs(self, status: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
         query = "SELECT id, status, title, company, location, date_posted FROM jobs"
         parameters: list[object] = []
@@ -482,14 +529,15 @@ class JobStore:
             return list(connection.execute(query, parameters).fetchall())
 
     def export_rows(self, job_ids: list[int] | None = None) -> list[dict]:
-        where = ""
+        clauses = ["j.eligible = 1", "j.status != 'rejected'"]
         parameters: list[object] = []
         if job_ids is not None:
             if not job_ids:
                 return []
             placeholders = ",".join("?" for _ in job_ids)
-            where = f"WHERE j.id IN ({placeholders})"
+            clauses.append(f"j.id IN ({placeholders})")
             parameters.extend(job_ids)
+        where = "WHERE " + " AND ".join(clauses)
 
         query = f"""
             SELECT

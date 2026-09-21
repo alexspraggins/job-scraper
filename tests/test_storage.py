@@ -87,7 +87,7 @@ def test_schema_version_is_recorded(tmp_path):
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "1"
+    assert version == "2"
 
 
 def test_status_validation_and_missing_job_errors(tmp_path):
@@ -96,3 +96,29 @@ def test_status_validation_and_missing_job_errors(tmp_path):
         store.set_status(1, "interviewing")
     with pytest.raises(KeyError):
         store.set_status(999, "reviewed")
+
+
+def test_reclassification_hides_ineligible_jobs_without_deleting_them(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    eligible_id, _ = store.upsert_job(
+        job_row(id="entry", title="Software Engineer I", job_url="https://example.com/entry"),
+        query_group="core_software",
+        search_term="software engineer",
+    )
+    ineligible_id, _ = store.upsert_job(
+        job_row(id="level-2", title="Software Engineer II", job_url="https://example.com/level-2"),
+        query_group="core_software",
+        search_term="software engineer",
+    )
+
+    eligible, ineligible = store.reclassify_jobs()
+    exported_ids = [row["id"] for row in store.export_rows()]
+
+    assert (eligible, ineligible) == (1, 1)
+    assert exported_ids == [eligible_id]
+    with store.connect() as connection:
+        stored = connection.execute(
+            "SELECT eligible, eligibility_reason FROM jobs WHERE id = ?",
+            (ineligible_id,),
+        ).fetchone()
+    assert tuple(stored) == (0, "excluded:level 2+")

@@ -168,6 +168,10 @@ ROLE_TERMS: dict[str, list[str]] = {
 }
 
 EXCLUDED_TITLE_TERMS = [
+    "mid level",
+    "midlevel",
+    "intermediate",
+    "experienced",
     "senior",
     "sr",
     "staff",
@@ -181,11 +185,17 @@ EXCLUDED_TITLE_TERMS = [
 ]
 
 ENTRY_LEVEL_TERMS = [
+    "entry",
     "entry level",
+    "early career",
     "junior",
     "associate",
     "new grad",
     "graduate",
+    "recent graduate",
+    "college graduate",
+    "university graduate",
+    "apprentice",
     "level 1",
     "level i",
     "engineer 1",

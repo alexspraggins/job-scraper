@@ -86,6 +86,7 @@ def export_all(
     new_job_ids: list[int] | None = None,
     timestamp: datetime | None = None,
 ) -> tuple[Path, Path | None]:
+    store.reclassify_jobs()
     current_path = export_current_jobs(store, export_dir)
     run_path = export_new_jobs(store, export_dir, new_job_ids or [], timestamp)
     return current_path, run_path
