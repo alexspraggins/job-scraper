@@ -11,6 +11,44 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_string(name: str, default: str) -> str:
+    """Return an environment value, falling back to the code-owned default."""
+    return os.getenv(name, default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean environment value while allowing intentionally blank values."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in _TRUE_VALUES
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer setting and identify the setting when it is malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise ValueError(f"Invalid integer for {name}: {raw!r}") from error
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a decimal setting and identify the setting when it is malformed."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise ValueError(f"Invalid number for {name}: {raw!r}") from error
+
+
 SEARCH_GROUPS: dict[str, list[str]] = {
     "core_software": [
         "software engineer",
@@ -210,52 +248,36 @@ QUERY_DELAY_SECONDS = 2
 SOURCE_TIMEOUT_SECONDS = 45
 # Indeed queries run in a small parallel pool while LinkedIn stays serial. This
 # overlaps the two sources without increasing LinkedIn's request rate.
-INDEED_MAX_WORKERS = max(1, int(os.getenv("JOB_SCRAPER_INDEED_MAX_WORKERS", "3")))
+INDEED_MAX_WORKERS = max(1, _env_int("JOB_SCRAPER_INDEED_MAX_WORKERS", 3))
 POLL_INTERVAL_SECONDS = 3600
 
 DATA_DIR = Path("data")
 DATABASE_PATH = DATA_DIR / "jobs.sqlite3"
 EXPORT_DIR = DATA_DIR / "exports"
 
-EMAIL_ENABLED = os.getenv("JOB_SCRAPER_EMAIL_ENABLED", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-EMAIL_FROM = os.getenv("JOB_SCRAPER_EMAIL_FROM", "")
-EMAIL_PASSWORD = os.getenv("JOB_SCRAPER_EMAIL_PASSWORD", "")
-EMAIL_TO = os.getenv("JOB_SCRAPER_EMAIL_TO", "")
-EMAIL_SMTP = os.getenv("JOB_SCRAPER_EMAIL_SMTP", "")
+EMAIL_ENABLED = _env_bool("JOB_SCRAPER_EMAIL_ENABLED", False)
+EMAIL_FROM = _env_string("JOB_SCRAPER_EMAIL_FROM", "")
+EMAIL_PASSWORD = _env_string("JOB_SCRAPER_EMAIL_PASSWORD", "")
+EMAIL_TO = _env_string("JOB_SCRAPER_EMAIL_TO", "")
+EMAIL_SMTP = _env_string("JOB_SCRAPER_EMAIL_SMTP", "")
 
 # Description enrichment and OpenAI analysis. LLM processing is opt-in so a
 # normal scrape never incurs API charges unexpectedly.
-LINKEDIN_DESCRIPTION_LIMIT = int(
-    os.getenv("JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT", "10")
-)
+LINKEDIN_DESCRIPTION_LIMIT = _env_int("JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT", 10)
 DESCRIPTION_FETCH_TIMEOUT_SECONDS = 20
 ENRICHMENT_LEASE_SECONDS = 15 * 60
 ENRICHMENT_NEW_TASK_QUOTA = 7
 ENRICHMENT_BACKLOG_TASK_QUOTA = 3
 ENRICHMENT_MAX_ATTEMPTS = 3
 
-LLM_ENABLED = os.getenv("JOB_SCRAPER_LLM_ENABLED", "false").lower() in {
-    "1", "true", "yes"
-}
-LLM_MODEL = os.getenv("JOB_SCRAPER_LLM_MODEL", "gpt-5-nano")
-LLM_MONTHLY_BUDGET_USD = float(
-    os.getenv("JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD", "3.00")
-)
-LLM_MAX_CALLS_PER_CYCLE = int(
-    os.getenv("JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE", "10")
-)
+LLM_ENABLED = _env_bool("JOB_SCRAPER_LLM_ENABLED", False)
+LLM_MODEL = _env_string("JOB_SCRAPER_LLM_MODEL", "gpt-5-nano")
+LLM_MONTHLY_BUDGET_USD = _env_float("JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD", 3.00)
+LLM_MAX_CALLS_PER_CYCLE = _env_int("JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE", 10)
 LLM_PROMPT_VERSION = "11"
 LLM_MAX_DESCRIPTION_CHARS = 30_000
-LLM_MAX_OUTPUT_TOKENS = int(
-    os.getenv("JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS", "6000")
-)
-VERBOSE_LOGGING = os.getenv("JOB_SCRAPER_VERBOSE_LOGGING", "false").lower() in {
-    "1", "true", "yes"
-}
+LLM_MAX_OUTPUT_TOKENS = _env_int("JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS", 6000)
+VERBOSE_LOGGING = _env_bool("JOB_SCRAPER_VERBOSE_LOGGING", False)
 # USD per one million tokens. Keep these conservative and versioned in usage rows.
 LLM_INPUT_PRICE_PER_MILLION = 0.05
 LLM_OUTPUT_PRICE_PER_MILLION = 0.40

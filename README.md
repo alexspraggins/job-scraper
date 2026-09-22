@@ -380,9 +380,18 @@ reservation.
 
 ## Configuration
 
-Copy `.env.example` to `.env` for local settings. `.env` is ignored by Git.
-Explicit shell environment variables take precedence over values loaded from
-`.env`.
+`.env` is optional. The fallback defaults are defined once in
+`src/job_scraper/config.py`; `.env.example` is only a template showing common
+overrides. If you need local settings, copy it to `.env`—that file is ignored
+by Git. Configuration precedence is:
+
+1. Explicitly exported shell variables or process-manager settings
+2. Values loaded from `.env`
+3. Defaults in `src/job_scraper/config.py`
+
+Blank secret values are safe when the related feature is disabled. For example,
+you do not need `OPENAI_API_KEY` unless LLM enrichment is enabled, and you do
+not need email credentials unless email notifications are enabled.
 
 ### Scraping
 
