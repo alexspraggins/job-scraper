@@ -509,8 +509,9 @@ include `required_skills`, `preferred_skills`, `experience`, and
 `analysis_status`. The status is the most conservative state across every
 stored posting, using `dead`, `unavailable`, `not_queued`, `budget_blocked`,
 `retry`, `pending`, or `completed`. Use `show JOB_ID` for source-level task and
-error details. Long descriptions and evidence remain in SQLite so the CSV stays
-compact.
+error details. The first columns are `id`, `status`, `title`, `preferred_url`,
+`company`, and `location`, so the preferred job link follows the title directly.
+Long descriptions and evidence remain in SQLite so the CSV stays compact.
 
 Generated databases, CSVs, caches, and local environments are ignored by Git.
 

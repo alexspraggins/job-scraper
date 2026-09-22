@@ -41,6 +41,9 @@ def test_exports_current_and_per_run_csv_without_separator_rows(tmp_path):
     with current_path.open(newline="", encoding="utf-8") as csv_file:
         rows = list(csv.DictReader(csv_file))
     assert list(rows[0]) == EXPORT_COLUMNS
+    assert EXPORT_COLUMNS[:6] == [
+        "id", "status", "title", "preferred_url", "company", "location",
+    ]
     assert len(rows) == 1
     assert rows[0]["title"] == "Junior Backend Engineer"
     assert rows[0]["compensation"] == "USD 90000-110000/yearly"
