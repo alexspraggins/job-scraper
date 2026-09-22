@@ -23,6 +23,10 @@ EXPORT_COLUMNS = [
     "preferred_url",
     "compensation",
     "matched_terms",
+    "required_skills",
+    "preferred_skills",
+    "experience",
+    "analysis_status",
     "notes",
 ]
 
@@ -64,7 +68,7 @@ def write_csv(path: str | Path, rows: list[dict]) -> Path:
 
 
 def export_current_jobs(store: JobStore, export_dir: str | Path) -> Path:
-    return write_csv(Path(export_dir) / "current_jobs.csv", store.export_rows())
+    return write_csv(Path(export_dir) / "current-jobs.csv", store.export_rows())
 
 
 def export_new_jobs(
@@ -76,7 +80,7 @@ def export_new_jobs(
     if not job_ids:
         return None
     timestamp = timestamp or datetime.now()
-    path = Path(export_dir) / "runs" / f"{timestamp:%Y%m%d_%H%M%S}_new_jobs.csv"
+    path = Path(export_dir) / "runs" / f"new-jobs-{timestamp:%Y-%m-%d-%H-%M-%S}.csv"
     return write_csv(path, store.export_rows(job_ids))
 
 

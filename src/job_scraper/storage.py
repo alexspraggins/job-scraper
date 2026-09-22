@@ -12,10 +12,11 @@ import sqlite3
 from typing import Iterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from . import config
 from .filtering import classify_title, normalize_text
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_STATUSES = ("new", "reviewed", "saved", "applied", "rejected")
 TRACKING_QUERY_KEYS = {
     "ref",
@@ -179,7 +180,22 @@ class JobStore:
                     unmatched_count INTEGER NOT NULL DEFAULT 0,
                     duplicate_count INTEGER NOT NULL DEFAULT 0,
                     new_count INTEGER NOT NULL DEFAULT 0,
-                    error_summary TEXT
+                    error_summary TEXT,
+                    description_tasks_created INTEGER NOT NULL DEFAULT 0,
+                    description_tasks_completed INTEGER NOT NULL DEFAULT 0,
+                    description_tasks_retried INTEGER NOT NULL DEFAULT 0,
+                    description_tasks_dead INTEGER NOT NULL DEFAULT 0,
+                    analysis_tasks_created INTEGER NOT NULL DEFAULT 0,
+                    analysis_tasks_completed INTEGER NOT NULL DEFAULT 0,
+                    analysis_tasks_retried INTEGER NOT NULL DEFAULT 0,
+                    analysis_tasks_budget_blocked INTEGER NOT NULL DEFAULT 0,
+                    analysis_tasks_dead INTEGER NOT NULL DEFAULT 0,
+                    openai_calls INTEGER NOT NULL DEFAULT 0,
+                    openai_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    openai_output_tokens INTEGER NOT NULL DEFAULT 0,
+                    openai_estimated_cost REAL NOT NULL DEFAULT 0,
+                    enrichment_error_summary TEXT,
+                    circuit_breaker_state TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS scrape_attempts (
@@ -225,6 +241,30 @@ class JobStore:
                     NOT NULL DEFAULT 'accepted'
                     """
                 )
+            run_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(scrape_runs)")
+            }
+            for name, definition in (
+                ("description_tasks_created", "INTEGER NOT NULL DEFAULT 0"),
+                ("description_tasks_completed", "INTEGER NOT NULL DEFAULT 0"),
+                ("description_tasks_retried", "INTEGER NOT NULL DEFAULT 0"),
+                ("description_tasks_dead", "INTEGER NOT NULL DEFAULT 0"),
+                ("analysis_tasks_created", "INTEGER NOT NULL DEFAULT 0"),
+                ("analysis_tasks_completed", "INTEGER NOT NULL DEFAULT 0"),
+                ("analysis_tasks_retried", "INTEGER NOT NULL DEFAULT 0"),
+                ("analysis_tasks_budget_blocked", "INTEGER NOT NULL DEFAULT 0"),
+                ("analysis_tasks_dead", "INTEGER NOT NULL DEFAULT 0"),
+                ("openai_calls", "INTEGER NOT NULL DEFAULT 0"),
+                ("openai_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("openai_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("openai_estimated_cost", "REAL NOT NULL DEFAULT 0"),
+                ("enrichment_error_summary", "TEXT"),
+                ("circuit_breaker_state", "TEXT"),
+            ):
+                if name not in run_columns:
+                    connection.execute(f"ALTER TABLE scrape_runs ADD COLUMN {name} {definition}")
+            from .queueing import initialize_enrichment_schema
+            initialize_enrichment_schema(connection)
             connection.execute(
                 """
                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)
@@ -317,6 +357,31 @@ class JobStore:
                     "\n".join(errors) or None,
                     run_id,
                 ),
+            )
+
+    def record_enrichment_summary(
+        self, run_id: int, *, fetch_created: int, fetch_completed: int,
+        fetch_retried: int, fetch_dead: int, analysis_created: int,
+        analysis_completed: int, analysis_retried: int, analysis_blocked: int,
+        analysis_dead: int, calls: int, input_tokens: int, output_tokens: int,
+        estimated_cost: float, errors: list[str], circuit_breakers: list[str],
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE scrape_runs SET description_tasks_created=?,
+                   description_tasks_completed=?, description_tasks_retried=?,
+                   description_tasks_dead=?, analysis_tasks_created=?,
+                   analysis_tasks_completed=?, analysis_tasks_retried=?,
+                   analysis_tasks_budget_blocked=?, analysis_tasks_dead=?,
+                   openai_calls=?, openai_input_tokens=?, openai_output_tokens=?,
+                   openai_estimated_cost=?, enrichment_error_summary=?,
+                   circuit_breaker_state=? WHERE id=?""",
+                (fetch_created, fetch_completed, fetch_retried, fetch_dead,
+                 analysis_created, analysis_completed, analysis_retried,
+                 analysis_blocked, analysis_dead, calls, input_tokens, output_tokens,
+                 estimated_cost, "\n".join(errors) or None,
+                 ",".join(state for state in circuit_breakers if state != "closed") or "closed",
+                 run_id),
             )
 
     def upsert_job(
@@ -417,7 +482,7 @@ class JobStore:
                 ON CONFLICT(source, source_key) DO UPDATE SET
                     job_url = COALESCE(NULLIF(excluded.job_url, ''), postings.job_url),
                     direct_url = COALESCE(NULLIF(excluded.direct_url, ''), postings.direct_url),
-                    description = COALESCE(excluded.description, postings.description),
+                    description = COALESCE(NULLIF(excluded.description, ''), postings.description),
                     job_type = COALESCE(excluded.job_type, postings.job_type),
                     salary_interval = COALESCE(excluded.salary_interval, postings.salary_interval),
                     min_amount = COALESCE(excluded.min_amount, postings.min_amount),
@@ -484,6 +549,13 @@ class JobStore:
                 """,
                 (job_id, job["status"], new_status, note, now),
             )
+            if new_status == "rejected":
+                connection.execute(
+                    """UPDATE enrichment_tasks SET status='cancelled', updated_at=?
+                       WHERE posting_id IN (SELECT id FROM postings WHERE job_id=?)
+                         AND status IN ('pending','retry','leased','budget_blocked')""",
+                    (now, job_id),
+                )
 
     def reclassify_jobs(self) -> tuple[int, int]:
         """Reapply current title rules without deleting jobs or workflow history."""
@@ -512,6 +584,12 @@ class JobStore:
                         WHERE id = ?
                         """,
                         (decision.reason, now, job["id"]),
+                    )
+                    connection.execute(
+                        """UPDATE enrichment_tasks SET status='cancelled', updated_at=?
+                           WHERE posting_id IN (SELECT id FROM postings WHERE job_id=?)
+                             AND status IN ('pending','retry','leased','budget_blocked')""",
+                        (now, job["id"]),
                     )
         return eligible_count, ineligible_count
 
@@ -563,8 +641,73 @@ class JobStore:
                 j.id DESC
         """
         with self.connect() as connection:
-            rows = connection.execute(query, parameters).fetchall()
-            return [dict(row) for row in rows]
+            rows = [dict(row) for row in connection.execute(query, parameters).fetchall()]
+            for row in rows:
+                requirements = connection.execute(
+                    """SELECT r.requirement_type,r.canonical_value,r.priority
+                       FROM posting_requirements r
+                       JOIN posting_analyses a ON a.id=r.analysis_id
+                       JOIN postings p ON p.id=a.posting_id
+                       WHERE p.job_id=? AND a.description_hash=p.description_hash
+                         AND a.model=? AND a.prompt_version=?
+                       ORDER BY r.requirement_type,r.priority,r.canonical_value""",
+                    (row["id"], config.LLM_MODEL, config.LLM_PROMPT_VERSION),
+                ).fetchall()
+                grouped: dict[str, list[str]] = {}
+                for requirement in requirements:
+                    key = requirement["requirement_type"]
+                    if key == "skill":
+                        key = f"{requirement['priority']}_skills"
+                    grouped.setdefault(key, [])
+                    if requirement["canonical_value"] not in grouped[key]:
+                        grouped[key].append(requirement["canonical_value"])
+                for key in (
+                    "required_skills", "preferred_skills", "experience",
+                ):
+                    row[key] = "; ".join(grouped.get(key, []))
+                states = connection.execute(
+                    """SELECT t.status FROM enrichment_tasks t
+                       JOIN postings p ON p.id=t.posting_id
+                       WHERE p.job_id=? AND t.task_type='analyze_description'
+                         AND t.description_hash=p.description_hash
+                         AND t.model=? AND t.prompt_version=?
+                       ORDER BY CASE status WHEN 'completed' THEN 0 WHEN 'dead' THEN 1
+                         WHEN 'budget_blocked' THEN 2 ELSE 3 END""",
+                    (row["id"], config.LLM_MODEL, config.LLM_PROMPT_VERSION),
+                ).fetchall()
+                row["analysis_status"] = states[0][0] if states else "not_queued"
+                if not states:
+                    fetch_state = connection.execute(
+                        """SELECT t.status FROM enrichment_tasks t JOIN postings p ON p.id=t.posting_id
+                           WHERE p.job_id=? AND t.task_type='fetch_description'
+                           ORDER BY CASE t.status WHEN 'pending' THEN 0 WHEN 'retry' THEN 1
+                             WHEN 'leased' THEN 2 WHEN 'dead' THEN 3 ELSE 4 END LIMIT 1""",
+                        (row["id"],),
+                    ).fetchone()
+                    if fetch_state:
+                        row["analysis_status"] = f"description_{fetch_state[0]}"
+            return rows
+
+    def get_job_details(self, job_id: int) -> dict:
+        with self.connect() as connection:
+            job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(f"Job {job_id} was not found")
+            postings = [dict(row) for row in connection.execute(
+                """SELECT id,source,COALESCE(direct_url,job_url) url,description_hash,
+                   description_fetched_at FROM postings WHERE job_id=? ORDER BY source,id""",
+                (job_id,),
+            )]
+            requirements = [dict(row) for row in connection.execute(
+                """SELECT r.requirement_type,r.canonical_value,r.category,r.priority,r.evidence
+                   FROM posting_requirements r JOIN posting_analyses a ON a.id=r.analysis_id
+                   JOIN postings p ON p.id=a.posting_id
+                   WHERE p.job_id=? AND a.description_hash=p.description_hash
+                     AND a.model=? AND a.prompt_version=?
+                   ORDER BY r.requirement_type,r.canonical_value""",
+                (job_id, config.LLM_MODEL, config.LLM_PROMPT_VERSION)
+            )]
+        return {"job": dict(job), "postings": postings, "requirements": requirements}
 
     def get_run(self, run_id: int) -> dict:
         with self.connect() as connection:

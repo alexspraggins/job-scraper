@@ -87,7 +87,7 @@ def test_schema_version_is_recorded(tmp_path):
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "2"
+    assert version == "3"
 
 
 def test_status_validation_and_missing_job_errors(tmp_path):

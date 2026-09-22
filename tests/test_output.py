@@ -1,4 +1,5 @@
 import csv
+import re
 
 from job_scraper.output import EXPORT_COLUMNS, export_all
 from job_scraper.storage import JobStore
@@ -31,6 +32,8 @@ def test_exports_current_and_per_run_csv_without_separator_rows(tmp_path):
 
     assert current_path.exists()
     assert run_path and run_path.exists()
+    assert current_path.name == "current-jobs.csv"
+    assert re.fullmatch(r"new-jobs-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.csv", run_path.name)
     with current_path.open(newline="", encoding="utf-8") as csv_file:
         rows = list(csv.DictReader(csv_file))
     assert list(rows[0]) == EXPORT_COLUMNS

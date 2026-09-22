@@ -5,9 +5,16 @@ description = "Job aggregation and filtering tool"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "beautifulsoup4>=4.14.0",
     "pandas>=2.3.3",
+    "python-dotenv>=1.2.0",
     "python-jobspy>=1.1.82",
     "requests>=2.34.2",
+]
+
+[project.optional-dependencies]
+llm = [
+    "openai>=2.0.0",
 ]
 
 [project.scripts]

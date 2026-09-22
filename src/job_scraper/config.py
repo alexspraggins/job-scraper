@@ -3,52 +3,47 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+# Load local development settings without overriding values explicitly exported
+# by the shell or supplied by a process manager.
+load_dotenv(override=False)
+
 
 SEARCH_GROUPS: dict[str, list[str]] = {
     "core_software": [
         "software engineer",
         "software developer",
-        "software development engineer",
     ],
     "backend_full_stack": [
         "backend engineer",
-        "backend developer",
         "full stack developer",
     ],
     "language_specific": [
         "python developer",
         "java developer",
-        "c++ developer",
-        "golang developer",
     ],
     "embedded_systems": [
         "embedded software engineer",
         "firmware engineer",
-        "systems software engineer",
     ],
     "platform_cloud": [
         "platform engineer",
-        "cloud engineer",
-        "site reliability engineer",
     ],
     "data": [
         "data engineer",
-        "etl developer",
     ],
     "quality_automation": [
         "test automation engineer",
-        "sdet",
-        "software test engineer",
     ],
     "robotics_edge": [
         "robotics software engineer",
         "computer vision engineer",
-        "iot engineer",
     ],
     "integration_research": [
         "integration engineer",
         "research software engineer",
-        "simulation software engineer",
     ],
 }
 
@@ -213,6 +208,9 @@ INITIAL_LOOKBACK_HOURS = 24
 RECURRING_LOOKBACK_HOURS = 2
 QUERY_DELAY_SECONDS = 2
 SOURCE_TIMEOUT_SECONDS = 45
+# Indeed queries run in a small parallel pool while LinkedIn stays serial. This
+# overlaps the two sources without increasing LinkedIn's request rate.
+INDEED_MAX_WORKERS = max(1, int(os.getenv("JOB_SCRAPER_INDEED_MAX_WORKERS", "3")))
 POLL_INTERVAL_SECONDS = 3600
 
 DATA_DIR = Path("data")
@@ -228,3 +226,37 @@ EMAIL_FROM = os.getenv("JOB_SCRAPER_EMAIL_FROM", "")
 EMAIL_PASSWORD = os.getenv("JOB_SCRAPER_EMAIL_PASSWORD", "")
 EMAIL_TO = os.getenv("JOB_SCRAPER_EMAIL_TO", "")
 EMAIL_SMTP = os.getenv("JOB_SCRAPER_EMAIL_SMTP", "")
+
+# Description enrichment and OpenAI analysis. LLM processing is opt-in so a
+# normal scrape never incurs API charges unexpectedly.
+LINKEDIN_DESCRIPTION_LIMIT = int(
+    os.getenv("JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT", "10")
+)
+DESCRIPTION_FETCH_TIMEOUT_SECONDS = 20
+ENRICHMENT_LEASE_SECONDS = 15 * 60
+ENRICHMENT_NEW_TASK_QUOTA = 7
+ENRICHMENT_BACKLOG_TASK_QUOTA = 3
+ENRICHMENT_MAX_ATTEMPTS = 3
+
+LLM_ENABLED = os.getenv("JOB_SCRAPER_LLM_ENABLED", "false").lower() in {
+    "1", "true", "yes"
+}
+LLM_MODEL = os.getenv("JOB_SCRAPER_LLM_MODEL", "gpt-5-nano")
+LLM_MONTHLY_BUDGET_USD = float(
+    os.getenv("JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD", "3.00")
+)
+LLM_MAX_CALLS_PER_CYCLE = int(
+    os.getenv("JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE", "10")
+)
+LLM_PROMPT_VERSION = "11"
+LLM_MAX_DESCRIPTION_CHARS = 30_000
+LLM_MAX_OUTPUT_TOKENS = int(
+    os.getenv("JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS", "6000")
+)
+VERBOSE_LOGGING = os.getenv("JOB_SCRAPER_VERBOSE_LOGGING", "false").lower() in {
+    "1", "true", "yes"
+}
+# USD per one million tokens. Keep these conservative and versioned in usage rows.
+LLM_INPUT_PRICE_PER_MILLION = 0.05
+LLM_OUTPUT_PRICE_PER_MILLION = 0.40
+LLM_PRICING_VERSION = "2026-09-21"
