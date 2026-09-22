@@ -30,6 +30,13 @@ from .queueing import EnrichmentQueue, TASK_STATUSES
 LOGGER = logging.getLogger("job_scraper")
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _configure_verbose_logging(enabled: bool) -> None:
     if not enabled:
         return
@@ -173,7 +180,6 @@ def run_scrape_cycle(
     _configure_verbose_logging(verbose_logging)
     run_started = datetime.now()
     run_id = store.start_run(lookback_hours)
-    queue = EnrichmentQueue(store, migrate_existing=False)
 
     raw_count = accepted_count = excluded_count = unmatched_count = 0
     duplicate_count = 0
@@ -181,6 +187,34 @@ def run_scrape_cycle(
     errors: list[str] = []
     fetch_tasks_created = analysis_tasks_created = 0
     terms = [(group, term) for group, group_terms in search_groups.items() for term in group_terms]
+    finalized = False
+
+    def finalize(status: str, final_errors: list[str]) -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        store.finish_run(
+            run_id,
+            status=status,
+            raw_count=raw_count,
+            accepted_count=accepted_count,
+            excluded_count=excluded_count,
+            unmatched_count=unmatched_count,
+            duplicate_count=duplicate_count,
+            new_count=len(set(new_job_ids)),
+            errors=final_errors,
+        )
+        finalized = True
+
+    try:
+        queue = EnrichmentQueue(store, migrate_existing=False)
+    except BaseException as error:
+        message = f"queue initialization: {type(error).__name__}: {error}"
+        finalize(
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            [message],
+        )
+        raise
 
     def store_attempt(
         source: str,
@@ -311,16 +345,9 @@ def run_scrape_cycle(
                         future.result,
                     )
     except BaseException as error:
-        store.finish_run(
-            run_id,
-            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
-            raw_count=raw_count,
-            accepted_count=accepted_count,
-            excluded_count=excluded_count,
-            unmatched_count=unmatched_count,
-            duplicate_count=duplicate_count,
-            new_count=len(set(new_job_ids)),
-            errors=[*errors, f"{type(error).__name__}: {error}"],
+        finalize(
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            [*errors, f"scraping: {type(error).__name__}: {error}"],
         )
         raise
 
@@ -329,52 +356,69 @@ def run_scrape_cycle(
     if errors and len(errors) == len(terms) * len(sources):
         status = "failed"
     enrichment = EnrichmentStats()
+    fatal_error: Exception | None = None
     if process_queues:
         try:
             enrichment = process_enrichment(
-                queue, current_run_id=run_id, verbose_logging=verbose_logging
+                queue, current_run_id=run_id, verbose_logging=verbose_logging,
+                max_seconds=config.ENRICHMENT_MAX_SECONDS,
+                api_call_limit=config.LLM_MAX_CALLS_PER_CYCLE,
             )
+            fetch_tasks_created += enrichment.orphan_fetch_created
+            analysis_tasks_created += (
+                enrichment.orphan_analysis_created + enrichment.fetch.analysis_created
+            )
+        except KeyboardInterrupt as error:
+            finalize("interrupted", [*errors, f"enrichment: {type(error).__name__}: {error}"])
+            raise
         except Exception as error:
-            # Queue work is deliberately best-effort; scrape data and exports survive.
+            fatal_error = error
+            errors.append(f"enrichment: {type(error).__name__}: {error}")
             enrichment.fetch.errors.append(f"Enrichment worker failed: {error}")
-    store.record_enrichment_summary(
-        run_id,
-        fetch_created=fetch_tasks_created,
-        fetch_completed=enrichment.fetch.completed,
-        fetch_retried=enrichment.fetch.retried,
-        fetch_dead=enrichment.fetch.dead,
-        analysis_created=analysis_tasks_created,
-        analysis_completed=enrichment.analysis.completed,
-        analysis_retried=enrichment.analysis.retried,
-        analysis_blocked=enrichment.analysis.budget_blocked,
-        analysis_dead=enrichment.analysis.dead,
-        calls=enrichment.analysis.calls,
-        input_tokens=enrichment.analysis.input_tokens,
-        output_tokens=enrichment.analysis.output_tokens,
-        estimated_cost=enrichment.analysis.estimated_cost,
-        errors=[*enrichment.fetch.errors, *enrichment.analysis.errors],
-        circuit_breakers=[enrichment.fetch.circuit_breaker,
-                          enrichment.analysis.circuit_breaker],
-    )
-    current_export, new_export = export_all(
-        store,
-        export_dir,
-        unique_new_ids,
-        run_started,
-    )
+    try:
+        store.record_enrichment_summary(
+            run_id,
+            fetch_created=fetch_tasks_created,
+            fetch_completed=enrichment.fetch.completed,
+            fetch_retried=enrichment.fetch.retried,
+            fetch_dead=enrichment.fetch.dead,
+            analysis_created=analysis_tasks_created,
+            analysis_completed=enrichment.analysis.completed,
+            analysis_retried=enrichment.analysis.retried,
+            analysis_blocked=enrichment.analysis.budget_blocked,
+            analysis_dead=enrichment.analysis.dead,
+            calls=enrichment.analysis.calls,
+            input_tokens=enrichment.analysis.input_tokens,
+            output_tokens=enrichment.analysis.output_tokens,
+            estimated_cost=enrichment.analysis.estimated_cost,
+            errors=[*enrichment.fetch.errors, *enrichment.analysis.errors],
+            circuit_breakers=[enrichment.fetch.circuit_breaker,
+                              enrichment.analysis.circuit_breaker],
+        )
+    except KeyboardInterrupt as error:
+        finalize("interrupted", [*errors, f"enrichment summary: {type(error).__name__}: {error}"])
+        raise
+    except Exception as error:
+        if fatal_error is None:
+            fatal_error = error
+        errors.append(f"enrichment summary: {type(error).__name__}: {error}")
+    try:
+        current_export, new_export = export_all(
+            store, export_dir, unique_new_ids, run_started,
+        )
+    except BaseException as error:
+        export_error = f"export: {type(error).__name__}: {error}"
+        finalize(
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            [*errors, export_error],
+        )
+        raise
+    if fatal_error is not None:
+        finalize("failed", errors)
+        raise RuntimeError("Scrape cycle failed during enrichment; exports were written") from fatal_error
     # A run is complete only after enrichment and exports finish. This makes
     # finished_at represent the full cycle instead of the source searches alone.
-    store.finish_run(
-        run_id,
-        status=status,
-        raw_count=raw_count,
-        accepted_count=accepted_count,
-        excluded_count=excluded_count,
-        unmatched_count=unmatched_count,
-        duplicate_count=duplicate_count,
-        new_count=len(unique_new_ids),
-        errors=errors,
-    )
+    finalize(status, errors)
     return RunSummary(
         run_id,
         raw_count,
@@ -412,12 +456,20 @@ def _print_summary(summary: RunSummary) -> None:
     analysis = summary.enrichment.analysis
     print(
         f"Enrichment: fetch created={summary.fetch_tasks_created}, "
-        f"completed={fetch.completed}, retry={fetch.retried}, dead={fetch.dead}; "
+        f"claimed={fetch.claimed}, completed={fetch.completed}, retry={fetch.retried}, dead={fetch.dead}; "
         f"analysis created={summary.analysis_tasks_created}, completed={analysis.completed}, "
-        f"retry={analysis.retried}, blocked={analysis.budget_blocked}, dead={analysis.dead}; "
+        f"claimed={analysis.claimed}, retry={analysis.retried}, blocked={analysis.budget_blocked}, dead={analysis.dead}; "
+        f"repairs={analysis.repair_attempts}, elapsed={summary.enrichment.elapsed_seconds:.1f}s; "
         f"OpenAI calls={analysis.calls}, tokens={analysis.input_tokens + analysis.output_tokens}, "
         f"cost=${analysis.estimated_cost:.6f}"
     )
+    if summary.enrichment.deadline_reached:
+        print("Enrichment window reached; remaining work stays queued.")
+    if summary.enrichment.remaining_tasks:
+        remaining = ", ".join(
+            f"{key}={value}" for key, value in sorted(summary.enrichment.remaining_tasks.items())
+        )
+        print(f"Enrichment remaining: {remaining}")
     for error in [*fetch.errors, *analysis.errors]:
         print(f"Enrichment warning: {error}", file=sys.stderr)
 
@@ -463,6 +515,9 @@ def run_command(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("Scraping stopped by user.")
         return 0
+    except Exception as error:
+        print(f"Scrape failed: {error}", file=sys.stderr)
+        return 1
 
 
 def list_command(args: argparse.Namespace) -> int:
@@ -533,21 +588,38 @@ def retry_command(args: argparse.Namespace) -> int:
 
 
 def enrich_command(args: argparse.Namespace) -> int:
-    queue = EnrichmentQueue(
-        JobStore(args.database), migrate_existing=args.migrate_existing
-    )
+    queue = EnrichmentQueue(JobStore(args.database), migrate_existing=False)
+    if args.migrate_existing:
+        migrated = queue.migrate_existing()
+        print(
+            f"Migration: fetch created={migrated['fetch_created']}, "
+            f"analysis created={migrated['analysis_created']}, "
+            f"cancelled={migrated['cancelled']}"
+        )
     verbose_logging = args.verbose or config.VERBOSE_LOGGING
     _configure_verbose_logging(verbose_logging)
     stats = process_enrichment(
         queue, fetch_limit=args.limit, analysis_limit=args.limit,
         fetch_only=args.fetch_only, verbose_logging=verbose_logging,
     )
-    print(f"Fetch: completed={stats.fetch.completed}, retry={stats.fetch.retried}, "
-          f"dead={stats.fetch.dead}")
+    if stats.orphan_fetch_created or stats.orphan_analysis_created:
+        print(
+            f"Orphan repair: fetch created={stats.orphan_fetch_created}, "
+            f"analysis created={stats.orphan_analysis_created}"
+        )
+    print(f"Fetch: claimed={stats.fetch.claimed}, completed={stats.fetch.completed}, "
+          f"retry={stats.fetch.retried}, dead={stats.fetch.dead}")
     if not args.fetch_only:
-        print(f"Analysis: completed={stats.analysis.completed}, retry={stats.analysis.retried}, "
-              f"blocked={stats.analysis.budget_blocked}, dead={stats.analysis.dead}, "
+        print(f"Analysis: claimed={stats.analysis.claimed}, completed={stats.analysis.completed}, "
+              f"retry={stats.analysis.retried}, blocked={stats.analysis.budget_blocked}, "
+              f"dead={stats.analysis.dead}, repairs={stats.analysis.repair_attempts}, "
               f"calls={stats.analysis.calls}")
+    print(f"Enrichment elapsed: {stats.elapsed_seconds:.1f}s")
+    if stats.remaining_tasks:
+        remaining = ", ".join(
+            f"{key}={value}" for key, value in sorted(stats.remaining_tasks.items())
+        )
+        print(f"Enrichment remaining: {remaining}")
     return 0
 
 
@@ -562,17 +634,37 @@ def show_command(args: argparse.Namespace) -> int:
     print(f"Job {job['id']}: {job['title']} — {job['company'] or ''}")
     print(f"Status: {job['status']}  Location: {job['location'] or ''}")
     for posting in details["postings"]:
-        print(f"Posting {posting['id']} ({posting['source']}): {posting['url'] or ''}")
+        description = posting["description_source"] or (
+            "stored" if posting["description_available"] else "unavailable"
+        )
+        print(
+            f"Posting {posting['posting_id']} ({posting['source']}): "
+            f"{posting['url'] or ''}"
+        )
+        print(
+            f"  Analysis: {posting['analysis_status']}  Description: {description}"
+        )
+        if posting["task_id"]:
+            print(
+                f"  Task {posting['task_id']}: {posting['task_type']} "
+                f"status={posting['task_status']} attempts={posting['attempt_count']}"
+            )
+        if posting["last_error_message"]:
+            print(
+                f"  Last error: {posting['last_error_class'] or 'Error'}: "
+                f"{posting['last_error_message']}"
+            )
     if not details["requirements"]:
         print("Requirements: not analyzed")
     for requirement in details["requirements"]:
-        print(f"- {requirement['requirement_type']} [{requirement['priority']}]: "
+        print(f"- posting {requirement['posting_id']} ({requirement['source']}) "
+              f"{requirement['requirement_type']} [{requirement['priority']}]: "
               f"{requirement['canonical_value']} — {requirement['evidence']}")
     return 0
 
 
 def usage_command(args: argparse.Namespace) -> int:
-    queue = EnrichmentQueue(JobStore(args.database))
+    queue = EnrichmentQueue(JobStore(args.database), migrate_existing=False)
     if args.resolve:
         if args.actual_cost is None:
             print("--actual-cost is required with --resolve", file=sys.stderr)
@@ -636,7 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.set_defaults(handler=retry_command)
 
     enrich_parser = subparsers.add_parser("enrich", help="Process due enrichment work")
-    enrich_parser.add_argument("--limit", type=int, default=20)
+    enrich_parser.add_argument("--limit", type=_positive_int, default=20)
     enrich_parser.add_argument("--fetch-only", action="store_true")
     enrich_parser.add_argument(
         "--migrate-existing", action="store_true",

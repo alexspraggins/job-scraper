@@ -154,7 +154,7 @@ def initialize_enrichment_schema(connection: sqlite3.Connection) -> None:
 
 
 class EnrichmentQueue:
-    def __init__(self, store: JobStore, *, migrate_existing: bool = True):
+    def __init__(self, store: JobStore, *, migrate_existing: bool = False):
         self.store = store
         with store.connect() as connection:
             initialize_enrichment_schema(connection)
@@ -273,14 +273,76 @@ class EnrichmentQueue:
                 total[key] += result[key]
         return total
 
-    def migrate_existing(self) -> None:
+    def migrate_existing(self) -> dict[str, int]:
+        total = {"fetch_created": 0, "analysis_created": 0, "cancelled": 0}
         with self.store.connect() as connection:
             ids = [r[0] for r in connection.execute(
                 """SELECT p.id FROM postings p JOIN jobs j ON j.id=p.job_id
                    WHERE j.eligible=1 AND j.status!='rejected'"""
             )]
         for posting_id in ids:
-            self.sync_posting(posting_id)
+            result = self.sync_posting(posting_id)
+            for key in total:
+                total[key] += result[key]
+        return total
+
+    def repair_orphans(
+        self, *, fetch_limit: int, analysis_limit: int,
+    ) -> dict[str, int]:
+        """Queue a bounded set of postings that have no current work or result."""
+        total = {"fetch_created": 0, "analysis_created": 0, "cancelled": 0}
+        with self.store.connect() as connection:
+            analysis_ids = [] if analysis_limit <= 0 else [
+                row[0] for row in connection.execute(
+                    """SELECT p.id
+                       FROM postings p JOIN jobs j ON j.id=p.job_id
+                       WHERE j.eligible=1 AND j.status!='rejected'
+                         AND TRIM(COALESCE(p.description,''))!=''
+                         AND NOT EXISTS (
+                             SELECT 1 FROM posting_analyses a
+                             WHERE a.posting_id=p.id
+                               AND a.description_hash=p.description_hash
+                               AND a.model=? AND a.prompt_version=?
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM enrichment_tasks t
+                             WHERE t.posting_id=p.id
+                               AND t.task_type='analyze_description'
+                               AND t.description_hash=p.description_hash
+                               AND t.model=? AND t.prompt_version=?
+                         )
+                       ORDER BY p.last_seen_at DESC,p.id
+                       LIMIT ?""",
+                    (
+                        config.LLM_MODEL, config.LLM_PROMPT_VERSION,
+                        config.LLM_MODEL, config.LLM_PROMPT_VERSION,
+                        analysis_limit,
+                    ),
+                )
+            ]
+            fetch_ids = [] if fetch_limit <= 0 else [
+                row[0] for row in connection.execute(
+                    """SELECT p.id
+                       FROM postings p JOIN jobs j ON j.id=p.job_id
+                       WHERE j.eligible=1 AND j.status!='rejected'
+                         AND p.source='linkedin'
+                         AND TRIM(COALESCE(p.description,''))=''
+                         AND TRIM(COALESCE(NULLIF(p.job_url,''),
+                             NULLIF(p.normalized_url,''),NULLIF(p.direct_url,''),''))!=''
+                         AND NOT EXISTS (
+                             SELECT 1 FROM enrichment_tasks t
+                             WHERE t.posting_id=p.id AND t.task_type='fetch_description'
+                         )
+                       ORDER BY p.last_seen_at DESC,p.id
+                       LIMIT ?""",
+                    (fetch_limit,),
+                )
+            ]
+        for posting_id in [*analysis_ids, *fetch_ids]:
+            result = self.sync_posting(posting_id)
+            for key in total:
+                total[key] += result[key]
+        return total
 
     def _reclaim_expired(self, connection: sqlite3.Connection, now: datetime) -> None:
         rows = connection.execute(
@@ -309,7 +371,7 @@ class EnrichmentQueue:
 
     def claim(
         self, task_type: str, limit: int, *, current_run_id: int | None = None,
-        now: datetime | None = None,
+        now: datetime | None = None, current_run_share: int | None = None,
     ) -> list[dict]:
         if task_type not in TASK_TYPES or limit <= 0:
             return []
@@ -325,21 +387,42 @@ class EnrichmentQueue:
                 (_iso(moment), month),
             )
             due = "status IN ('pending','retry') AND next_attempt_at <= ?"
-            params: list[object] = [task_type, _iso(moment)]
-            rows = list(connection.execute(
-                f"""SELECT * FROM enrichment_tasks WHERE task_type=? AND {due}
-                     ORDER BY next_attempt_at, created_at, id""", params
-            ).fetchall())
+            due_at = _iso(moment)
+
+            def select_rows(condition: str, values: list[object], amount: int) -> list:
+                if amount <= 0:
+                    return []
+                return list(connection.execute(
+                    f"""SELECT * FROM enrichment_tasks
+                         WHERE task_type=? AND {due} {condition}
+                         ORDER BY next_attempt_at, created_at, id LIMIT ?""",
+                    [task_type, due_at, *values, amount],
+                ).fetchall())
+
             if current_run_id is None:
-                selected = rows[:limit]
+                selected = select_rows("", [], limit)
             else:
-                current = [r for r in rows if r["scrape_run_id"] == current_run_id]
-                backlog = [r for r in rows if r["scrape_run_id"] != current_run_id]
-                selected = current[:min(7, limit)] + backlog[:min(3, max(0, limit - min(7, limit)))]
-                selected_ids = {r["id"] for r in selected}
-                selected += [r for r in rows if r["id"] not in selected_ids][:
-                    max(0, limit - len(selected))
-                ]
+                share = config.ENRICHMENT_CURRENT_RUN_SHARE if current_run_share is None else current_run_share
+                share = max(0, min(100, share))
+                current_quota = min(limit, round(limit * share / 100))
+                backlog_quota = max(0, limit - current_quota)
+                selected = select_rows(
+                    "AND scrape_run_id=?", [current_run_id], current_quota
+                )
+                selected += select_rows(
+                    "AND (scrape_run_id IS NULL OR scrape_run_id!=?)",
+                    [current_run_id], backlog_quota,
+                )
+                remaining = limit - len(selected)
+                if remaining:
+                    selected_ids = [row["id"] for row in selected]
+                    exclusion = ""
+                    values: list[object] = []
+                    if selected_ids:
+                        placeholders = ",".join("?" for _ in selected_ids)
+                        exclusion = f"AND id NOT IN ({placeholders})"
+                        values.extend(selected_ids)
+                    selected += select_rows(exclusion, values, remaining)
             claimed = []
             for row in selected:
                 token = uuid4().hex
@@ -369,7 +452,7 @@ class EnrichmentQueue:
             raise KeyError(f"Task {task_id} was not found")
         return dict(row)
 
-    def complete_fetch(self, task_id: int, token: str, description: str) -> bool:
+    def complete_fetch(self, task_id: int, token: str, description: str) -> tuple[bool, bool]:
         text = normalize_description(description)
         if not text:
             raise ValueError("Description was empty")
@@ -382,7 +465,7 @@ class EnrichmentQueue:
                 (task_id, token),
             ).fetchone()
             if task is None:
-                return False
+                return False, False
             connection.execute(
                 """UPDATE postings SET description=?, description_hash=?,
                    description_source='linkedin_fetch', description_fetched_at=? WHERE id=?""",
@@ -394,7 +477,7 @@ class EnrichmentQueue:
                      AND description_hash != ? AND status IN ('pending','retry','budget_blocked')""",
                 (now, task["posting_id"], digest),
             )
-            self._create_task(
+            _, analysis_created = self._create_task(
                 connection, task_type="analyze_description", posting_id=task["posting_id"],
                 identity=self._analysis_identity(task["posting_id"], digest,
                     config.LLM_MODEL, config.LLM_PROMPT_VERSION),
@@ -405,7 +488,7 @@ class EnrichmentQueue:
                 """UPDATE enrichment_tasks SET status='completed', completed_at=?, updated_at=?,
                    lease_token=NULL, lease_expires_at=NULL WHERE id=?""", (now, now, task_id)
             )
-        return True
+        return True, analysis_created
 
     def complete_analysis(self, task_id: int, token: str, requirements: Iterable[dict]) -> bool:
         now = _iso()

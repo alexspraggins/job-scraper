@@ -164,12 +164,19 @@ Every scrape synchronizes newly stored or changed postings with the durable
 SQLite enrichment queue. Queue work is processed after the source searches and
 before the run exports are written.
 
-The automatic worker reserves up to seven slots for tasks created by the
-current run and up to three slots for backlog or retry tasks. The configured
-automatic limits are:
+The automatic worker gives approximately 70% of each batch to tasks created by
+the current run and 30% to older backlog or retry tasks. It processes repeated
+batches for up to five minutes by default, while the configured limits provide
+safety caps:
 
-- up to 10 LinkedIn description fetches per cycle
-- up to 10 OpenAI analyses per cycle
+- up to 50 LinkedIn description fetches per cycle
+- up to 50 analysis task claims per cycle
+- up to 50 actual OpenAI requests per cycle, including repair requests
+
+The five-minute window is reported in the run summary. If work remains when the
+window closes, it stays in SQLite and is picked up by a later run or an explicit
+`enrich` command. When evidence validation rejects a model response, the worker
+makes one constrained repair attempt before applying the normal retry schedule.
 
 Tasks survive process restarts. A 15-minute lease allows interrupted work to
 be recovered. Transient failures retry after one hour, then six hours. The
@@ -182,7 +189,9 @@ uv run job-scraper enrich --limit 20
 ```
 
 `--limit` defaults to 20 for this manual command. It applies to both fetch and
-analysis workers.
+analysis task counts, independently, and must be a positive integer. Manual
+processing repeats 10-task batches until the requested limits are reached or no
+due work remains; it does not use the automatic five-minute deadline.
 
 Fetch LinkedIn descriptions without making OpenAI calls:
 
@@ -195,9 +204,11 @@ Completing a LinkedIn fetch creates an analysis task, so a later normal
 
 ### Repair or backfill missing tasks
 
-Normal scrape, export, queue inspection, retry, and show commands do not scan
-every existing job for missing tasks. Newly stored jobs are synchronized
-immediately.
+Normal enrichment performs a bounded repair for eligible postings that clearly
+need a task but have none. The repair is capped by that invocation's fetch and
+analysis limits and never revives dead or cancelled work. Export, queue
+inspection, retry, show, and usage commands do not backfill tasks. Newly stored
+jobs are synchronized immediately.
 
 After an interrupted run, database migration, or manual data repair, explicitly
 backfill missing tasks:
@@ -265,7 +276,7 @@ uv run job-scraper usage --resolve RESERVATION_TOKEN --actual-cost 0.0042
 | LinkedIn description missing | `queue --status retry` or `queue --status dead` | Retry the task after the source recovers; inspect the task error. |
 | Analysis task is retrying | `queue --status retry` | Run `enrich --verbose`; check structured-output or evidence-validation errors. |
 | Tasks are budget blocked | `usage` and `.env` budget setting | Wait for the next UTC month or raise the configured budget deliberately. |
-| A job has no enrichment task | `show JOB_ID` and queue summary | Run `enrich --migrate-existing`. |
+| A job has no enrichment task | `show JOB_ID` and queue summary | Run `enrich`; use `--migrate-existing` only when full reconciliation is needed. |
 | CSV lacks expected skills | `show JOB_ID` and `analysis_status` | Process pending work with `enrich`, then run `export`. |
 | OpenAI configuration error | `OPENAI_API_KEY`, optional dependency, and `JOB_SCRAPER_LLM_ENABLED` | Run `uv sync --dev --extra llm`, configure the key, and retry. |
 
@@ -398,7 +409,7 @@ not need email credentials unless email notifications are enabled.
 | Variable | Default | Description |
 |---|---:|---|
 | `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Concurrent Indeed search workers. LinkedIn remains serial. |
-| `JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT` | `10` | Maximum LinkedIn fetches per automatic cycle. |
+| `JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT` | `50` | Maximum LinkedIn fetches per automatic cycle. |
 
 ### OpenAI enrichment
 
@@ -408,8 +419,12 @@ not need email credentials unless email notifications are enabled.
 | `JOB_SCRAPER_LLM_ENABLED` | `false` | Enables API calls when true. |
 | `JOB_SCRAPER_LLM_MODEL` | `gpt-5-nano` | Selects the model and analysis cache identity. |
 | `JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD` | `3.00` | Hard monthly budget. |
-| `JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE` | `10` | Maximum analysis calls per automatic cycle. |
+| `JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE` | `50` | Maximum analysis calls per automatic cycle. |
 | `JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS` | `6000` | Maximum structured output per analysis; affects projected reservations. |
+| `JOB_SCRAPER_OPENAI_REQUEST_TIMEOUT_SECONDS` | `60` | Maximum duration of one OpenAI request; automatic runs also respect their remaining enrichment window. |
+| `JOB_SCRAPER_ENRICHMENT_MAX_SECONDS` | `300` | Maximum automatic enrichment time per scrape cycle. |
+| `JOB_SCRAPER_ENRICHMENT_BATCH_SIZE` | `10` | Tasks claimed per repeated enrichment batch. |
+| `JOB_SCRAPER_ENRICHMENT_CURRENT_RUN_SHARE` | `70` | Percentage of each batch reserved for newest jobs. |
 
 ### Logging
 
@@ -491,8 +506,11 @@ data/exports/runs/new-jobs-YYYY-MM-DD-HH-MM-SS.csv
 `current-jobs.csv` is the consolidated eligible-job view. Per-run CSV files
 contain only new canonical jobs from that run. Exported enrichment columns
 include `required_skills`, `preferred_skills`, `experience`, and
-`analysis_status`. Long descriptions and evidence remain in SQLite so the CSV
-stays compact.
+`analysis_status`. The status is the most conservative state across every
+stored posting, using `dead`, `unavailable`, `not_queued`, `budget_blocked`,
+`retry`, `pending`, or `completed`. Use `show JOB_ID` for source-level task and
+error details. Long descriptions and evidence remain in SQLite so the CSV stays
+compact.
 
 Generated databases, CSVs, caches, and local environments are ignored by Git.
 

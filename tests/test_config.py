@@ -18,6 +18,10 @@ def reload_config(monkeypatch, *, dotenv_path=None, **values):
         "JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD",
         "JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE",
         "JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS",
+        "JOB_SCRAPER_ENRICHMENT_MAX_SECONDS",
+        "JOB_SCRAPER_ENRICHMENT_BATCH_SIZE",
+        "JOB_SCRAPER_ENRICHMENT_CURRENT_RUN_SHARE",
+        "JOB_SCRAPER_OPENAI_REQUEST_TIMEOUT_SECONDS",
         "JOB_SCRAPER_VERBOSE_LOGGING",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -39,12 +43,16 @@ def test_configuration_uses_code_defaults_when_environment_is_empty(monkeypatch)
     loaded = reload_config(monkeypatch)
 
     assert loaded.INDEED_MAX_WORKERS == 3
-    assert loaded.LINKEDIN_DESCRIPTION_LIMIT == 10
+    assert loaded.LINKEDIN_DESCRIPTION_LIMIT == 50
     assert loaded.LLM_ENABLED is False
     assert loaded.LLM_MODEL == "gpt-5-nano"
     assert loaded.LLM_MONTHLY_BUDGET_USD == 3.00
-    assert loaded.LLM_MAX_CALLS_PER_CYCLE == 10
+    assert loaded.LLM_MAX_CALLS_PER_CYCLE == 50
     assert loaded.LLM_MAX_OUTPUT_TOKENS == 6000
+    assert loaded.ENRICHMENT_MAX_SECONDS == 300
+    assert loaded.ENRICHMENT_BATCH_SIZE == 10
+    assert loaded.ENRICHMENT_CURRENT_RUN_SHARE == 70
+    assert loaded.OPENAI_REQUEST_TIMEOUT_SECONDS == 60.0
     assert loaded.VERBOSE_LOGGING is False
 
 
@@ -58,6 +66,7 @@ def test_environment_values_override_code_defaults(monkeypatch):
         JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD="4.25",
         JOB_SCRAPER_LLM_MAX_CALLS_PER_CYCLE="6",
         JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS="7000",
+        JOB_SCRAPER_OPENAI_REQUEST_TIMEOUT_SECONDS="12.5",
         JOB_SCRAPER_VERBOSE_LOGGING="on",
     )
 
@@ -68,6 +77,7 @@ def test_environment_values_override_code_defaults(monkeypatch):
     assert loaded.LLM_MONTHLY_BUDGET_USD == 4.25
     assert loaded.LLM_MAX_CALLS_PER_CYCLE == 6
     assert loaded.LLM_MAX_OUTPUT_TOKENS == 7000
+    assert loaded.OPENAI_REQUEST_TIMEOUT_SECONDS == 12.5
     assert loaded.VERBOSE_LOGGING is True
 
 

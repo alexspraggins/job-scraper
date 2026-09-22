@@ -4,7 +4,9 @@ from job_scraper import config
 from job_scraper.enrichment import (
     AnalysisError,
     FetchError,
+    call_openai,
     process_analysis_queue,
+    process_enrichment,
     process_fetch_queue,
     supplement_structured_requirements,
     validate_completeness,
@@ -92,6 +94,7 @@ def test_linkedin_fetch_completion_creates_analysis_in_same_operation(tmp_path, 
             sleeper=lambda _: None, verbose_logging=True,
         )
     assert stats.completed == 1
+    assert stats.analysis_created == 1
     with store.connect() as connection:
         posting = connection.execute(
             "SELECT description,description_hash FROM postings WHERE job_id=?", (job_id,)
@@ -196,6 +199,63 @@ def test_invalid_evidence_is_retried(tmp_path):
     stats = process_analysis_queue(queue, limit=1, analyzer=analyzer, enabled=True)
     assert stats.retried == 1
     assert queue.list_tasks("retry")[0]["attempt_count"] == 1
+
+
+def test_validation_failure_gets_one_repair_attempt(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    job_id = add_posting(store, description="Python is required.")
+    queue.sync_job(job_id)
+    calls = []
+
+    def analyzer(_description):
+        calls.append(True)
+        if len(calls) == 1:
+            return ({"requirements": [{"type": "skill", "value": "Rust", "category": "language",
+                "priority": "required", "evidence": "Rust is required"}]}, 10, 10)
+        return ({"requirements": [{"type": "skill", "value": "Python", "category": "language",
+            "priority": "required", "evidence": "Python is required"}]}, 10, 10)
+
+    stats = process_analysis_queue(queue, limit=1, analyzer=analyzer, enabled=True)
+    assert stats.completed == 1
+    assert stats.repair_attempts == 1
+    assert stats.calls == 2
+    assert queue.list_tasks("completed")[0]["id"]
+
+
+def test_enrichment_deadline_releases_claimed_work(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    job_id = add_posting(store, source="linkedin")
+    queue.sync_job(job_id)
+
+    stats = process_fetch_queue(
+        queue, limit=1, fetcher=lambda _url: "Python required",
+        deadline=0, clock=lambda: 1,
+    )
+    assert stats.deadline_reached is True
+    assert queue.list_tasks("pending")[0]["job_id"] == job_id
+
+
+def test_bounded_enrichment_processes_multiple_batches(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    for suffix in ("1", "2", "3"):
+        job_id = add_posting(store, description=f"Python is required {suffix}.", suffix=suffix)
+        queue.sync_job(job_id)
+    monkeypatch.setattr(config, "LLM_ENABLED", True)
+    monkeypatch.setattr(config, "ENRICHMENT_BATCH_SIZE", 1)
+
+    stats = process_enrichment(
+        queue, analysis_limit=10, fetch_only=False,
+        analyzer=lambda _description: ({"requirements": [{"type": "skill", "value": "Python",
+            "category": "language", "priority": "required", "evidence": "Python is required"}]}, 10, 10),
+        max_seconds=30,
+        clock=lambda: 0,
+        verbose_logging=False,
+    )
+    assert stats.analysis.completed == 3
+    assert stats.analysis.claimed == 3
 
 
 def test_invalid_entries_are_dropped_when_supported_entries_remain(tmp_path):
@@ -408,9 +468,165 @@ def test_existing_data_migration_queues_both_sources(tmp_path):
     add_posting(store, description="Python required", suffix="indeed")
     add_posting(store, source="linkedin", suffix="linkedin")
     queue = EnrichmentQueue(store)
+    queue.migrate_existing()
     summary = {(row["task_type"], row["status"]): row["count"] for row in queue.queue_summary()}
     assert summary[("analyze_description", "pending")] == 1
     assert summary[("fetch_description", "pending")] == 1
+
+
+def test_manual_enrichment_limit_processes_more_than_one_batch(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    for number in range(12):
+        job_id = add_posting(
+            store, description=f"Python is required for role {number}.", suffix=str(number)
+        )
+        queue.sync_job(job_id)
+    monkeypatch.setattr(config, "LLM_ENABLED", True)
+
+    stats = process_enrichment(
+        queue,
+        fetch_limit=0,
+        analysis_limit=12,
+        analyzer=lambda _description: ({"requirements": [{
+            "type": "skill", "value": "Python", "category": "language",
+            "priority": "required", "evidence": "Python is required",
+        }]}, 10, 10),
+    )
+
+    assert stats.analysis.claimed == 12
+    assert stats.analysis.completed == 12
+
+
+def test_automatic_call_limit_counts_repair_requests(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    for number in range(10):
+        job_id = add_posting(
+            store, description="Python is required.", suffix=f"cap-{number}"
+        )
+        queue.sync_job(job_id)
+    monkeypatch.setattr(config, "LLM_ENABLED", True)
+    monkeypatch.setattr(config, "LLM_MONTHLY_BUDGET_USD", 100.0)
+
+    stats = process_enrichment(
+        queue,
+        fetch_limit=0,
+        analysis_limit=10,
+        api_call_limit=5,
+        analyzer=lambda _description: ({"requirements": [{
+            "type": "skill", "value": "Rust", "category": "language",
+            "priority": "required", "evidence": "Rust is required",
+        }]}, 10, 10),
+    )
+
+    assert stats.analysis.calls == 5
+    assert stats.analysis.repair_attempts == 2
+    assert len(queue.list_tasks("retry")) == 3
+
+
+def test_circuit_breaker_stops_later_batches(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    for number in range(12):
+        job_id = add_posting(
+            store, description="Python is required.", suffix=f"breaker-{number}"
+        )
+        queue.sync_job(job_id)
+    monkeypatch.setattr(config, "LLM_ENABLED", True)
+    calls = []
+
+    def fail_configuration(_description):
+        calls.append(True)
+        raise AnalysisError("bad key", service_config=True, stop=True)
+
+    stats = process_enrichment(
+        queue, fetch_limit=0, analysis_limit=12, analyzer=fail_configuration
+    )
+
+    assert len(calls) == 1
+    assert stats.analysis.circuit_breaker == "configuration"
+    assert len(queue.list_tasks("pending")) == 12
+
+
+def test_bounded_orphan_repair_queues_only_supported_missing_work(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    analysis_jobs = [
+        add_posting(store, description="Python required", suffix=f"analysis-{index}")
+        for index in range(3)
+    ]
+    linkedin_job = add_posting(store, source="linkedin", suffix="fetch")
+    add_posting(store, source="skillsire", suffix="unsupported")
+    queue = EnrichmentQueue(store)
+
+    repaired = queue.repair_orphans(fetch_limit=1, analysis_limit=2)
+
+    assert repaired["analysis_created"] == 2
+    assert repaired["fetch_created"] == 1
+    queued_jobs = {
+        task["job_id"] for status in ("pending",) for task in queue.list_tasks(status)
+    }
+    assert linkedin_job in queued_jobs
+    assert len(set(analysis_jobs) & queued_jobs) == 2
+    with store.connect() as connection:
+        unsupported = connection.execute(
+            """SELECT COUNT(*) FROM enrichment_tasks t JOIN postings p ON p.id=t.posting_id
+               WHERE p.source='skillsire'"""
+        ).fetchone()[0]
+    assert unsupported == 0
+
+
+def test_orphan_repair_does_not_replace_dead_task(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    job_id = add_posting(store, source="linkedin", suffix="dead")
+    queue.sync_job(job_id)
+    task = queue.claim("fetch_description", 1)[0]
+    queue.fail(task["id"], task["lease_token"], FetchError("gone"), permanent=True)
+
+    repaired = queue.repair_orphans(fetch_limit=10, analysis_limit=10)
+
+    assert repaired["fetch_created"] == 0
+    assert len(queue.list_tasks("dead")) == 1
+
+
+def test_openai_call_uses_timeout_and_disables_sdk_retries(monkeypatch):
+    import openai
+
+    captured = {}
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            captured["request"] = kwargs
+            return type("Response", (), {
+                "output_text": '{"requirements": []}',
+                "usage": type("Usage", (), {"input_tokens": 1, "output_tokens": 2})(),
+            })()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+
+    assert call_openai("Python required", timeout_seconds=7.5)[1:] == (1, 2)
+    assert captured["client"]["max_retries"] == 0
+    assert captured["request"]["timeout"] == 7.5
+
+
+def test_network_timeout_leaves_unknown_usage_and_retries_task(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    queue = EnrichmentQueue(store)
+    queue.sync_job(add_posting(store, description="Python required", suffix="timeout"))
+
+    def timeout(_description):
+        raise AnalysisError("timed out", network=True)
+
+    stats = process_analysis_queue(queue, limit=1, analyzer=timeout, enabled=True)
+
+    assert stats.retried == 1
+    assert queue.outstanding_usage()[0]["status"] == "unknown"
 
 
 def test_validate_requirements_resolves_priority_conflicts():

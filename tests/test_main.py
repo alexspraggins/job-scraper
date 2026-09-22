@@ -4,7 +4,10 @@ import threading
 import time
 import pytest
 
+import job_scraper.main as main_module
 from job_scraper.main import _scrape_source_with_timeout, main, run_scrape_cycle
+from job_scraper.enrichment import EnrichmentStats, FetchError, WorkerStats
+from job_scraper.queueing import EnrichmentQueue
 from job_scraper.storage import JobStore
 
 
@@ -236,3 +239,157 @@ def test_default_searches_have_fifteen_representatives_across_all_families():
     assert len(config.SEARCH_GROUPS) == 9
     assert sum(map(len, config.SEARCH_GROUPS.values())) == 15
     assert set(config.SEARCH_GROUPS) == set(config.ROLE_TERMS)
+
+
+def empty_cycle_options(tmp_path):
+    return {
+        "search_groups": {"core_software": ["software engineer"]},
+        "sources": ["indeed"],
+        "scraper": lambda **_kwargs: pd.DataFrame(),
+        "query_delay_seconds": 0,
+        "source_timeout_seconds": 0,
+        "export_dir": tmp_path / "exports",
+    }
+
+
+def latest_run(store):
+    with store.connect() as connection:
+        return dict(connection.execute(
+            "SELECT * FROM scrape_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone())
+
+
+def test_enrichment_crash_exports_then_finalizes_failed(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    def fail_enrichment(*_args, **_kwargs):
+        raise RuntimeError("worker crashed")
+
+    monkeypatch.setattr(main_module, "process_enrichment", fail_enrichment)
+
+    with pytest.raises(RuntimeError, match="exports were written"):
+        run_scrape_cycle(store, 24, **empty_cycle_options(tmp_path))
+
+    assert latest_run(store)["status"] == "failed"
+    assert "enrichment: RuntimeError: worker crashed" in latest_run(store)["error_summary"]
+    assert (tmp_path / "exports" / "current-jobs.csv").exists()
+
+
+def test_enrichment_summary_crash_exports_then_finalizes_failed(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    def fail_summary(*_args, **_kwargs):
+        raise RuntimeError("summary failed")
+
+    monkeypatch.setattr(store, "record_enrichment_summary", fail_summary)
+
+    with pytest.raises(RuntimeError, match="exports were written"):
+        run_scrape_cycle(
+            store, 24, process_queues=False, **empty_cycle_options(tmp_path)
+        )
+
+    assert latest_run(store)["status"] == "failed"
+    assert (tmp_path / "exports" / "current-jobs.csv").exists()
+
+
+def test_run_summary_counts_analysis_tasks_created_after_fetch(tmp_path, monkeypatch):
+    stats = EnrichmentStats(fetch=WorkerStats(completed=2, analysis_created=2))
+    monkeypatch.setattr(main_module, "process_enrichment", lambda *_args, **_kwargs: stats)
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    summary = run_scrape_cycle(store, 24, **empty_cycle_options(tmp_path))
+
+    assert summary.analysis_tasks_created == 2
+    assert latest_run(store)["analysis_tasks_created"] == 2
+
+
+def test_export_crash_finalizes_failed(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    monkeypatch.setattr(
+        main_module, "export_all",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("export failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="export failed"):
+        run_scrape_cycle(
+            store, 24, process_queues=False, **empty_cycle_options(tmp_path)
+        )
+
+    run = latest_run(store)
+    assert run["status"] == "failed"
+    assert "export: RuntimeError: export failed" in run["error_summary"]
+
+
+def test_enrichment_interrupt_finalizes_interrupted(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(main_module, "process_enrichment", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_scrape_cycle(store, 24, **empty_cycle_options(tmp_path))
+
+    assert latest_run(store)["status"] == "interrupted"
+
+
+def test_queue_initialization_failure_finalizes_run(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    class BrokenQueue:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("queue failed")
+
+    monkeypatch.setattr(main_module, "EnrichmentQueue", BrokenQueue)
+
+    with pytest.raises(RuntimeError, match="queue failed"):
+        run_scrape_cycle(store, 24, **empty_cycle_options(tmp_path))
+
+    assert latest_run(store)["status"] == "failed"
+
+
+def test_enrich_limit_must_be_positive():
+    with pytest.raises(SystemExit) as error:
+        main(["enrich", "--limit", "0"])
+    assert error.value.code == 2
+
+
+def test_show_reports_source_task_status_and_error(tmp_path, capsys):
+    database = tmp_path / "jobs.sqlite3"
+    store = JobStore(database)
+    job_id, _ = store.upsert_job(
+        {
+            "id": "linkedin-show",
+            "site": "linkedin",
+            "job_url": "https://www.linkedin.com/jobs/view/show",
+            "title": "Software Engineer I",
+            "company": "Example",
+            "location": "Remote",
+            "role_family": "core_software",
+            "seniority": "entry",
+            "matched_terms": ["software engineer"],
+        },
+        query_group="core_software",
+        search_term="software engineer",
+    )
+    queue = EnrichmentQueue(store)
+    queue.sync_job(job_id)
+    task = queue.claim("fetch_description", 1)[0]
+    queue.fail(task["id"], task["lease_token"], FetchError("gone"), permanent=True)
+
+    assert main(["--database", str(database), "show", str(job_id)]) == 0
+    output = capsys.readouterr().out
+    assert "Analysis: dead" in output
+    assert "fetch_description status=dead attempts=1" in output
+    assert "Last error: FetchError: gone" in output
+
+
+def test_run_command_returns_clean_nonzero_for_cycle_failure(monkeypatch, capsys):
+    def fail_cycle(*_args, **_kwargs):
+        raise RuntimeError("cycle failed")
+
+    monkeypatch.setattr(main_module, "run_scrape_cycle", fail_cycle)
+
+    assert main(["run", "--once"]) == 1
+    assert "Scrape failed: cycle failed" in capsys.readouterr().err

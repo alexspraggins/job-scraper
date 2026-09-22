@@ -18,6 +18,15 @@ from .filtering import classify_title, normalize_text
 
 SCHEMA_VERSION = 3
 VALID_STATUSES = ("new", "reviewed", "saved", "applied", "rejected")
+ANALYSIS_STATUS_PRIORITY = {
+    "dead": 0,
+    "unavailable": 1,
+    "not_queued": 2,
+    "budget_blocked": 3,
+    "retry": 4,
+    "pending": 5,
+    "completed": 6,
+}
 TRACKING_QUERY_KEYS = {
     "ref",
     "refid",
@@ -642,17 +651,11 @@ class JobStore:
         """
         with self.connect() as connection:
             rows = [dict(row) for row in connection.execute(query, parameters).fetchall()]
+            selected_ids = [row["id"] for row in rows]
+            requirements_by_job = self._current_requirements(connection, selected_ids)
+            postings_by_job = self._posting_states(connection, selected_ids)
             for row in rows:
-                requirements = connection.execute(
-                    """SELECT r.requirement_type,r.canonical_value,r.priority
-                       FROM posting_requirements r
-                       JOIN posting_analyses a ON a.id=r.analysis_id
-                       JOIN postings p ON p.id=a.posting_id
-                       WHERE p.job_id=? AND a.description_hash=p.description_hash
-                         AND a.model=? AND a.prompt_version=?
-                       ORDER BY r.requirement_type,r.priority,r.canonical_value""",
-                    (row["id"], config.LLM_MODEL, config.LLM_PROMPT_VERSION),
-                ).fetchall()
+                requirements = requirements_by_job.get(row["id"], [])
                 grouped: dict[str, list[str]] = {}
                 for requirement in requirements:
                     key = requirement["requirement_type"]
@@ -665,48 +668,156 @@ class JobStore:
                     "required_skills", "preferred_skills", "experience",
                 ):
                     row[key] = "; ".join(grouped.get(key, []))
-                states = connection.execute(
-                    """SELECT t.status FROM enrichment_tasks t
-                       JOIN postings p ON p.id=t.posting_id
-                       WHERE p.job_id=? AND t.task_type='analyze_description'
-                         AND t.description_hash=p.description_hash
-                         AND t.model=? AND t.prompt_version=?
-                       ORDER BY CASE status WHEN 'completed' THEN 0 WHEN 'dead' THEN 1
-                         WHEN 'budget_blocked' THEN 2 ELSE 3 END""",
-                    (row["id"], config.LLM_MODEL, config.LLM_PROMPT_VERSION),
-                ).fetchall()
-                row["analysis_status"] = states[0][0] if states else "not_queued"
-                if not states:
-                    fetch_state = connection.execute(
-                        """SELECT t.status FROM enrichment_tasks t JOIN postings p ON p.id=t.posting_id
-                           WHERE p.job_id=? AND t.task_type='fetch_description'
-                           ORDER BY CASE t.status WHEN 'pending' THEN 0 WHEN 'retry' THEN 1
-                             WHEN 'leased' THEN 2 WHEN 'dead' THEN 3 ELSE 4 END LIMIT 1""",
-                        (row["id"],),
-                    ).fetchone()
-                    if fetch_state:
-                        row["analysis_status"] = f"description_{fetch_state[0]}"
+                states = [
+                    posting["analysis_status"]
+                    for posting in postings_by_job.get(row["id"], [])
+                ]
+                row["analysis_status"] = min(
+                    states or ["unavailable"],
+                    key=ANALYSIS_STATUS_PRIORITY.__getitem__,
+                )
             return rows
+
+    @staticmethod
+    def _id_chunks(values: list[int], size: int = 500) -> Iterator[list[int]]:
+        for start in range(0, len(values), size):
+            yield values[start:start + size]
+
+    def _current_requirements(
+        self, connection: sqlite3.Connection, job_ids: list[int],
+    ) -> dict[int, list[dict]]:
+        grouped: dict[int, list[dict]] = {}
+        for chunk in self._id_chunks(job_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"""SELECT p.job_id,p.id posting_id,p.source,r.requirement_type,
+                           r.canonical_value,r.category,r.priority,r.evidence
+                    FROM posting_requirements r
+                    JOIN posting_analyses a ON a.id=r.analysis_id
+                    JOIN postings p ON p.id=a.posting_id
+                    WHERE p.job_id IN ({placeholders})
+                      AND a.description_hash=p.description_hash
+                      AND a.model=? AND a.prompt_version=?
+                    ORDER BY p.job_id,p.id,r.requirement_type,r.priority,
+                             r.canonical_value""",
+                [*chunk, config.LLM_MODEL, config.LLM_PROMPT_VERSION],
+            ).fetchall()
+            for source_row in rows:
+                row = dict(source_row)
+                grouped.setdefault(row["job_id"], []).append(row)
+        return grouped
+
+    def _posting_states(
+        self, connection: sqlite3.Connection, job_ids: list[int],
+    ) -> dict[int, list[dict]]:
+        postings: list[dict] = []
+        tasks_by_posting: dict[int, list[dict]] = {}
+        for chunk in self._id_chunks(job_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            posting_rows = connection.execute(
+                f"""SELECT p.id posting_id,p.job_id,p.source,
+                           COALESCE(NULLIF(p.job_url,''),NULLIF(p.normalized_url,''),
+                                    NULLIF(p.direct_url,'')) source_url,
+                           COALESCE(NULLIF(p.direct_url,''),NULLIF(p.job_url,'')) url,
+                           p.description,
+                           p.description_hash,p.description_source,
+                           p.description_fetched_at,
+                           EXISTS(
+                               SELECT 1 FROM posting_analyses a
+                               WHERE a.posting_id=p.id
+                                 AND a.description_hash=p.description_hash
+                                 AND a.model=? AND a.prompt_version=?
+                           ) analysis_completed
+                    FROM postings p WHERE p.job_id IN ({placeholders})
+                    ORDER BY p.job_id,p.source,p.id""",
+                [config.LLM_MODEL, config.LLM_PROMPT_VERSION, *chunk],
+            ).fetchall()
+            postings.extend(dict(row) for row in posting_rows)
+            posting_ids = [row["posting_id"] for row in posting_rows]
+            for posting_chunk in self._id_chunks(posting_ids):
+                task_placeholders = ",".join("?" for _ in posting_chunk)
+                task_rows = connection.execute(
+                    f"""SELECT id,identity_key,posting_id,task_type,status,
+                               description_hash,model,prompt_version,attempt_count,
+                               last_error_class,last_error_message,next_attempt_at
+                        FROM enrichment_tasks
+                        WHERE posting_id IN ({task_placeholders})
+                        ORDER BY id DESC""",
+                    posting_chunk,
+                ).fetchall()
+                for source_row in task_rows:
+                    task = dict(source_row)
+                    tasks_by_posting.setdefault(task["posting_id"], []).append(task)
+
+        grouped: dict[int, list[dict]] = {}
+        for posting in postings:
+            posting_tasks = tasks_by_posting.get(posting["posting_id"], [])
+            description = str(posting["description"] or "").strip()
+            task: dict | None = None
+            state: str
+            if posting["analysis_completed"]:
+                state = "completed"
+                task = next((item for item in posting_tasks if (
+                    item["task_type"] == "analyze_description"
+                    and item["description_hash"] == posting["description_hash"]
+                    and item["model"] == config.LLM_MODEL
+                    and item["prompt_version"] == config.LLM_PROMPT_VERSION
+                )), None)
+            elif description:
+                task = next((item for item in posting_tasks if (
+                    item["task_type"] == "analyze_description"
+                    and item["description_hash"] == posting["description_hash"]
+                    and item["model"] == config.LLM_MODEL
+                    and item["prompt_version"] == config.LLM_PROMPT_VERSION
+                )), None)
+                state = self._task_analysis_state(task, completed="not_queued")
+            elif posting["source"] == "linkedin" and posting["source_url"]:
+                identity_url = normalize_url(posting["source_url"])
+                identity = f"fetch:{posting['posting_id']}:" + hashlib.sha256(
+                    identity_url.encode()
+                ).hexdigest()
+                task = next((item for item in posting_tasks if (
+                    item["task_type"] == "fetch_description"
+                    and item["identity_key"] == identity
+                )), None)
+                state = self._task_analysis_state(task, completed="unavailable")
+            else:
+                state = "unavailable"
+            detail = dict(posting)
+            detail.pop("description", None)
+            detail["description_available"] = bool(description)
+            detail["analysis_status"] = state
+            detail["task_id"] = task["id"] if task else None
+            detail["task_type"] = task["task_type"] if task else None
+            detail["task_status"] = task["status"] if task else None
+            detail["attempt_count"] = task["attempt_count"] if task else 0
+            detail["last_error_class"] = task["last_error_class"] if task else None
+            detail["last_error_message"] = task["last_error_message"] if task else None
+            detail["next_attempt_at"] = task["next_attempt_at"] if task else None
+            grouped.setdefault(posting["job_id"], []).append(detail)
+        return grouped
+
+    @staticmethod
+    def _task_analysis_state(
+        task: dict | None, *, completed: str = "completed",
+    ) -> str:
+        if task is None or task["status"] == "cancelled":
+            return "not_queued"
+        if task["status"] == "leased":
+            return "pending"
+        if task["status"] == "completed":
+            return completed
+        if task["status"] in ANALYSIS_STATUS_PRIORITY:
+            return task["status"]
+        return "not_queued"
 
     def get_job_details(self, job_id: int) -> dict:
         with self.connect() as connection:
             job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if job is None:
                 raise KeyError(f"Job {job_id} was not found")
-            postings = [dict(row) for row in connection.execute(
-                """SELECT id,source,COALESCE(direct_url,job_url) url,description_hash,
-                   description_fetched_at FROM postings WHERE job_id=? ORDER BY source,id""",
-                (job_id,),
-            )]
-            requirements = [dict(row) for row in connection.execute(
-                """SELECT r.requirement_type,r.canonical_value,r.category,r.priority,r.evidence
-                   FROM posting_requirements r JOIN posting_analyses a ON a.id=r.analysis_id
-                   JOIN postings p ON p.id=a.posting_id
-                   WHERE p.job_id=? AND a.description_hash=p.description_hash
-                     AND a.model=? AND a.prompt_version=?
-                   ORDER BY r.requirement_type,r.canonical_value""",
-                (job_id, config.LLM_MODEL, config.LLM_PROMPT_VERSION)
-            )]
+            postings = self._posting_states(connection, [job_id]).get(job_id, [])
+            requirements = self._current_requirements(connection, [job_id]).get(job_id, [])
         return {"job": dict(job), "postings": postings, "requirements": requirements}
 
     def get_run(self, run_id: int) -> dict:

@@ -2,7 +2,9 @@
 
 import csv
 from datetime import datetime
+import os
 from pathlib import Path
+import tempfile
 
 from .storage import JobStore
 
@@ -60,10 +62,23 @@ def _prepare_rows(rows: list[dict]) -> list[dict]:
 def write_csv(path: str | Path, rows: list[dict]) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=EXPORT_COLUMNS)
-        writer.writeheader()
-        writer.writerows(_prepare_rows(rows))
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", newline="", encoding="utf-8", dir=target.parent,
+            prefix=f".{target.name}.", suffix=".tmp", delete=False,
+        ) as csv_file:
+            temporary_path = Path(csv_file.name)
+            writer = csv.DictWriter(csv_file, fieldnames=EXPORT_COLUMNS)
+            writer.writeheader()
+            writer.writerows(_prepare_rows(rows))
+            csv_file.flush()
+            os.fsync(csv_file.fileno())
+        os.replace(temporary_path, target)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
     return target
 
 
