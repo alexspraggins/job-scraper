@@ -1,6 +1,6 @@
 # Job Scraper
 
-Job Scraper searches Indeed and LinkedIn for early-career software roles,
+Job Scraper searches Indeed, LinkedIn, and Glassdoor for early-career software roles,
 filters and deduplicates the results, stores them in SQLite, optionally
 extracts requirements with OpenAI, and writes readable CSV exports.
 
@@ -23,7 +23,7 @@ separate public-description fetch, then queued for analysis.
 
 - Python 3.14 or newer
 - [`uv`](https://docs.astral.sh/uv/)
-- Network access for live Indeed/LinkedIn searches
+- Network access for live Indeed/LinkedIn/Glassdoor searches
 - An OpenAI API key only if LLM enrichment is enabled
 
 ### Install and test
@@ -98,6 +98,8 @@ uv run job-scraper run
 
 The first continuous cycle uses the 24-hour lookback. Later cycles run hourly
 with a two-hour overlapping lookback. Stop continuous mode with `Ctrl+C`.
+Indeed searches run in a small parallel pool; LinkedIn and Glassdoor run in a
+serial lane, so enabling the third default source increases coverage and runtime.
 
 For a different one-time lookback:
 
@@ -315,13 +317,14 @@ uv run job-scraper --database private/jobs.sqlite3 run --once
 ### `run`
 
 ```bash
-uv run job-scraper run [--once] [--lookback-hours HOURS] [--verbose]
+uv run job-scraper run [--once] [--lookback-hours HOURS] [--no-enrichment] [--verbose]
 ```
 
 | Option | Description |
 |---|---|
 | `--once` | Run one cycle and exit. Without it, continue hourly. |
 | `--lookback-hours HOURS` | Override the first cycle's lookback; default is 24 hours. |
+| `--no-enrichment` | Skip description fetching and OpenAI analysis; keep fetch/filter/export fast. |
 | `--verbose` | Log scrape and enrichment timing details. |
 
 ### `list`
@@ -420,7 +423,7 @@ not need email credentials unless email notifications are enabled.
 
 | Variable | Default | Description |
 |---|---:|---|
-| `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Concurrent Indeed search workers. LinkedIn remains serial. |
+| `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Concurrent Indeed search workers. LinkedIn and Glassdoor remain serial. |
 | `JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT` | `50` | Maximum LinkedIn fetches per automatic cycle. |
 
 ### OpenAI enrichment
@@ -483,6 +486,11 @@ Each run reports raw, accepted, excluded, unmatched, duplicate, new, and error
 counts. A failure from one source or query does not discard successful results
 from other attempts.
 
+Live sources are isolated behind a common adapter boundary. Skillsire is no
+longer a live source, although historical Skillsire postings remain readable
+in SQLite. Dice is not included yet, but can be added as another adapter
+without changing filtering, storage, enrichment, or exports.
+
 ## Data and outputs
 
 ### SQLite
@@ -525,6 +533,11 @@ error details. The first columns are `id`, `status`, `title`, `preferred_url`,
 `company`, and `location`, so the preferred job link follows the title directly.
 Long descriptions and evidence remain in SQLite so the CSV stays compact.
 
+`current-jobs.csv` is a rolling 24-hour view. Jobs are included when their
+precise `date_posted` timestamp is within the last 24 hours; missing, date-only,
+or malformed posting dates fall back to the time the job was first discovered.
+The SQLite database and `list`/`show` commands retain older jobs for history.
+
 Generated databases, CSVs, caches, and local environments are ignored by Git.
 
 ## Testing and development
@@ -548,10 +561,19 @@ temporary cache directory:
 Focused suites:
 
 ```bash
+./.venv/bin/python -m pytest tests/test_cli.py tests/test_config.py tests/test_filtering.py tests/test_sources.py -q
 ./.venv/bin/python -m pytest tests/test_enrichment.py -q
 ./.venv/bin/python -m pytest tests/test_output.py tests/test_main.py -q
 ./.venv/bin/python -m pytest tests/test_storage.py tests/test_enrichment.py -q
+./.venv/bin/python -m pytest tests/test_system.py -q
 ```
+
+The focused modules are organized by test boundary: CLI parsing, configuration,
+filtering, and source normalization are unit coverage; pipeline, storage,
+enrichment, and export behavior are integration coverage; `test_system.py`
+exercises the CLI in a separate Python process across listing, status updates,
+showing, and export. The system test uses a temporary database and does not
+contact live job sites.
 
 The suite uses temporary databases and mocked network/LLM calls, so it is the
 preferred feedback loop for code changes.
