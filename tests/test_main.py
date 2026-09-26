@@ -1,7 +1,9 @@
 import logging
-import pandas as pd
 import threading
 import time
+from types import SimpleNamespace
+
+import pandas as pd
 import pytest
 
 import job_scraper.main as main_module
@@ -393,3 +395,21 @@ def test_run_command_returns_clean_nonzero_for_cycle_failure(monkeypatch, capsys
 
     assert main(["run", "--once"]) == 1
     assert "Scrape failed: cycle failed" in capsys.readouterr().err
+
+
+def test_run_no_enrichment_skips_queue_processing(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_cycle(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(errors=(), new_export=None)
+
+    monkeypatch.setattr(main_module, "run_scrape_cycle", fake_cycle)
+    monkeypatch.setattr(main_module, "_print_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main_module, "_email_new_jobs", lambda *_args: None)
+
+    assert main([
+        "--database", str(tmp_path / "jobs.sqlite3"),
+        "run", "--once", "--no-enrichment",
+    ]) == 0
+    assert captured["process_queues"] is False

@@ -105,6 +105,18 @@ For a different one-time lookback:
 uv run job-scraper run --once --lookback-hours 48
 ```
 
+For a fast periodic job list, skip enrichment entirely:
+
+```bash
+uv run job-scraper run --no-enrichment
+```
+
+This keeps the hourly fetch, title filtering, deduplication, SQLite storage,
+and CSV export, but does not fetch descriptions or call OpenAI. Use
+`--once --no-enrichment` for a single quick refresh. The filtered list is
+written to `data/exports/current-jobs.csv`; queued enrichment can be processed
+later with `uv run job-scraper enrich`.
+
 ### Review and update jobs
 
 ```bash

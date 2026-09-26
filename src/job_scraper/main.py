@@ -436,7 +436,7 @@ def run_scrape_cycle(
     )
 
 
-def _print_summary(summary: RunSummary) -> None:
+def _print_summary(summary: RunSummary, *, enrichment_skipped: bool = False) -> None:
     print(
         f"Run {summary.run_id}: raw={summary.raw_count}, "
         f"accepted={summary.accepted_count}, excluded={summary.excluded_count}, "
@@ -452,6 +452,13 @@ def _print_summary(summary: RunSummary) -> None:
     else:
         print("No new jobs: all accepted listings were already stored.")
     print(f"Current jobs: {summary.current_export}")
+    if enrichment_skipped:
+        print(
+            "Enrichment: skipped. Jobs were filtered and exported; "
+            "run `uv run job-scraper enrich` later if needed."
+        )
+        return
+
     fetch = summary.enrichment.fetch
     analysis = summary.enrichment.analysis
     print(
@@ -504,8 +511,9 @@ def run_command(args: argparse.Namespace) -> int:
             summary = run_scrape_cycle(
                 store, lookback, export_dir=args.output_dir,
                 verbose_logging=args.verbose or config.VERBOSE_LOGGING,
+                process_queues=not args.no_enrichment,
             )
-            _print_summary(summary)
+            _print_summary(summary, enrichment_skipped=args.no_enrichment)
             _email_new_jobs(summary)
             if args.once:
                 return 0 if not summary.errors else 1
@@ -699,6 +707,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run job searches")
     run_parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
     run_parser.add_argument("--lookback-hours", type=int)
+    run_parser.add_argument(
+        "--no-enrichment", "--skip-enrichment", dest="no_enrichment",
+        action="store_true",
+        help="Fetch, filter, store, and export jobs without processing enrichment",
+    )
     run_parser.add_argument("--verbose", action="store_true",
                             help="Log scrape and enrichment timing details")
     run_parser.set_defaults(handler=run_command)
