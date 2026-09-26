@@ -1,33 +1,26 @@
-"""Multi-query scraper orchestration and command-line interface."""
+"""Command-line interface for the job scraper."""
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
-import logging
-import multiprocessing
 from pathlib import Path
-from queue import Empty
 import sys
 import time
-from typing import Callable, Sequence
-
-import pandas as pd
-from jobspy import scrape_jobs
+from typing import Sequence
 
 from . import config
 from .emailer import send_email
-from .enrichment import EnrichmentStats, process_enrichment
-from .filtering import filter_jobs
+from .enrichment import process_enrichment
 from .output import export_all
-from .skillsire import scrape_skillsire
-from .storage import JobStore, VALID_STATUSES
+from .pipeline import (
+    RunSummary,
+    _configure_verbose_logging,
+    run_scrape_cycle as _run_scrape_cycle,
+)
 from .queueing import EnrichmentQueue, TASK_STATUSES
-
-
-LOGGER = logging.getLogger("job_scraper")
+from .sources import scrape_source_with_timeout as _scrape_source_with_timeout
+from .storage import JobStore, VALID_STATUSES
 
 
 def _positive_int(value: str) -> int:
@@ -37,403 +30,12 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _configure_verbose_logging(enabled: bool) -> None:
-    if not enabled:
-        return
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s,%(msecs)03d - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    LOGGER.setLevel(logging.INFO)
-
-
-@dataclass(frozen=True)
-class RunSummary:
-    run_id: int
-    raw_count: int
-    accepted_count: int
-    excluded_count: int
-    unmatched_count: int
-    duplicate_count: int
-    new_job_ids: tuple[int, ...]
-    errors: tuple[str, ...]
-    current_export: Path
-    new_export: Path | None
-    enrichment: EnrichmentStats
-    fetch_tasks_created: int = 0
-    analysis_tasks_created: int = 0
-
-
-def _scrape_source(
-    source: str,
-    search_term: str,
-    lookback_hours: int,
-    scraper: Callable[..., pd.DataFrame],
-) -> pd.DataFrame:
-    if source == "skillsire":
-        empty = pd.DataFrame(columns=["job_url", "title", "company", "location"])
-        result = scrape_skillsire(
-            empty,
-            hours=lookback_hours,
-            search_term=search_term,
-            results_fetch_count=config.RESULTS_PER_QUERY,
-        )
-        if not result.empty:
-            result = result.copy()
-            result["site"] = "skillsire"
-        return result
-
-    return scraper(
-        site_name=[source],
-        search_term=search_term,
-        location=config.LOCATION,
-        results_wanted=config.RESULTS_PER_QUERY,
-        hours_old=lookback_hours,
-        country_indeed=config.COUNTRY,
-    )
-
-
-def _scrape_worker(
-    result_queue,
-    source: str,
-    search_term: str,
-    lookback_hours: int,
-    scraper: Callable[..., pd.DataFrame],
-) -> None:
-    try:
-        result_queue.put(
-            ("ok", _scrape_source(source, search_term, lookback_hours, scraper))
-        )
-    except Exception as error:
-        result_queue.put(("error", f"{type(error).__name__}: {error}"))
-
-
-def _scrape_source_with_timeout(
-    source: str,
-    search_term: str,
-    lookback_hours: int,
-    scraper: Callable[..., pd.DataFrame],
-    timeout_seconds: float,
-) -> pd.DataFrame:
-    if timeout_seconds <= 0:
-        return _scrape_source(source, search_term, lookback_hours, scraper)
-
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue(maxsize=1)
-    process = context.Process(
-        target=_scrape_worker,
-        args=(result_queue, source, search_term, lookback_hours, scraper),
-    )
-    process.start()
-    try:
-        result_type, payload = result_queue.get(timeout=timeout_seconds)
-    except Empty as error:
-        if process.is_alive():
-            process.terminate()
-            process.join(5)
-            raise TimeoutError(
-                f"source request exceeded {timeout_seconds:g} seconds"
-            ) from error
-        raise RuntimeError(
-            f"source worker exited without a result (exit code {process.exitcode})"
-        ) from error
-    finally:
-        result_queue.close()
-
-    process.join(5)
-    if process.is_alive():
-        process.terminate()
-        process.join(5)
-
-    if result_type == "error":
-        raise RuntimeError(payload)
-    return payload
-
-
-def run_scrape_cycle(
-    store: JobStore,
-    lookback_hours: int,
-    *,
-    search_groups: dict[str, list[str]] | None = None,
-    sources: list[str] | None = None,
-    scraper: Callable[..., pd.DataFrame] = scrape_jobs,
-    query_delay_seconds: float | None = None,
-    source_timeout_seconds: float | None = None,
-    sleeper: Callable[[float], None] = time.sleep,
-    export_dir: str | Path | None = None,
-    process_queues: bool = True,
-    verbose_logging: bool | None = None,
-) -> RunSummary:
-    search_groups = search_groups or config.SEARCH_GROUPS
-    sources = list(sources or config.SOURCES)
-    if config.SKILLSIRE_ENABLED and "skillsire" not in sources:
-        sources.append("skillsire")
-    delay = config.QUERY_DELAY_SECONDS if query_delay_seconds is None else query_delay_seconds
-    source_timeout = (
-        config.SOURCE_TIMEOUT_SECONDS
-        if source_timeout_seconds is None
-        else source_timeout_seconds
-    )
-    export_dir = Path(export_dir or config.EXPORT_DIR)
-    verbose_logging = config.VERBOSE_LOGGING if verbose_logging is None else verbose_logging
-    _configure_verbose_logging(verbose_logging)
-    run_started = datetime.now()
-    run_id = store.start_run(lookback_hours)
-
-    raw_count = accepted_count = excluded_count = unmatched_count = 0
-    duplicate_count = 0
-    new_job_ids: list[int] = []
-    errors: list[str] = []
-    fetch_tasks_created = analysis_tasks_created = 0
-    terms = [(group, term) for group, group_terms in search_groups.items() for term in group_terms]
-    finalized = False
-
-    def finalize(status: str, final_errors: list[str]) -> None:
-        nonlocal finalized
-        if finalized:
-            return
-        store.finish_run(
-            run_id,
-            status=status,
-            raw_count=raw_count,
-            accepted_count=accepted_count,
-            excluded_count=excluded_count,
-            unmatched_count=unmatched_count,
-            duplicate_count=duplicate_count,
-            new_count=len(set(new_job_ids)),
-            errors=final_errors,
-        )
-        finalized = True
-
-    try:
-        queue = EnrichmentQueue(store, migrate_existing=False)
-    except BaseException as error:
-        message = f"queue initialization: {type(error).__name__}: {error}"
-        finalize(
-            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
-            [message],
-        )
-        raise
-
-    def store_attempt(
-        source: str,
-        query_group: str,
-        search_term: str,
-        result: Callable[[], pd.DataFrame],
-    ) -> None:
-        nonlocal raw_count, accepted_count, excluded_count, unmatched_count
-        nonlocal duplicate_count, fetch_tasks_created, analysis_tasks_created
-        started = time.perf_counter()
-        try:
-            jobs = result()
-            if jobs is None:
-                jobs = pd.DataFrame()
-            if verbose_logging:
-                LOGGER.info(
-                    "scrape: run=%s source=%s term=%r outcome=completed results=%s duration_ms=%d",
-                    run_id, source, search_term, len(jobs),
-                    round((time.perf_counter() - started) * 1000),
-                )
-            accepted, stats = filter_jobs(jobs)
-            raw_count += stats.raw
-            accepted_count += stats.accepted
-            excluded_count += stats.excluded
-            unmatched_count += stats.unmatched
-            store.record_attempt(
-                run_id,
-                source,
-                query_group,
-                search_term,
-                stats.raw,
-                stats.accepted,
-                stats.excluded,
-                stats.unmatched,
-            )
-
-            for row in accepted.to_dict(orient="records"):
-                row["site"] = row.get("site") or source
-                job_id, is_new = store.upsert_job(
-                    row,
-                    query_group=query_group,
-                    search_term=search_term,
-                )
-                queued = queue.sync_job(job_id, run_id)
-                fetch_tasks_created += queued["fetch_created"]
-                analysis_tasks_created += queued["analysis_created"]
-                if is_new:
-                    new_job_ids.append(job_id)
-                else:
-                    duplicate_count += 1
-                if verbose_logging:
-                    LOGGER.info(
-                        "scrape: run=%s job_id=%s source=%s action=stored new=%s title=%r company=%r",
-                        run_id, job_id, source, is_new,
-                        row.get("title", ""), row.get("company", ""),
-                    )
-        except Exception as error:
-            message = f"{source}/{query_group}/{search_term}: {error}"
-            errors.append(message)
-            store.record_attempt(
-                run_id,
-                source,
-                query_group,
-                search_term,
-                error=str(error),
-            )
-            print(f"Search failed: {message}", file=sys.stderr)
-            if verbose_logging:
-                LOGGER.info(
-                    "scrape: run=%s source=%s term=%r outcome=failed error=%s duration_ms=%d",
-                    run_id, source, search_term, type(error).__name__,
-                    round((time.perf_counter() - started) * 1000),
-                )
-
-    try:
-        parallel_indeed = "indeed" in sources and config.INDEED_MAX_WORKERS > 1
-        serial_sources = [
-            source for source in sources if source != "indeed" or not parallel_indeed
-        ]
-        indeed_futures: dict[tuple[str, str], Future[pd.DataFrame]] = {}
-
-        with ThreadPoolExecutor(
-            max_workers=config.INDEED_MAX_WORKERS,
-            thread_name_prefix="indeed-search",
-        ) as executor:
-            if parallel_indeed:
-                for query_group, search_term in terms:
-                    indeed_futures[(query_group, search_term)] = executor.submit(
-                        _scrape_source_with_timeout,
-                        "indeed",
-                        search_term,
-                        lookback_hours,
-                        scraper,
-                        source_timeout,
-                    )
-
-            # LinkedIn and optional sources stay in one serial lane. The delay
-            # applies here, so parallel Indeed work cannot increase LinkedIn's
-            # request rate.
-            for term_index, (query_group, search_term) in enumerate(terms):
-                for source in serial_sources:
-                    store_attempt(
-                        source,
-                        query_group,
-                        search_term,
-                        lambda source=source, search_term=search_term: (
-                            _scrape_source_with_timeout(
-                                source,
-                                search_term,
-                                lookback_hours,
-                                scraper,
-                                source_timeout,
-                            )
-                        ),
-                    )
-                if serial_sources and delay and term_index < len(terms) - 1:
-                    sleeper(delay)
-
-            # Consume results in deterministic query order even though the
-            # network requests ran concurrently.
-            for query_group, search_term in terms:
-                future = indeed_futures.get((query_group, search_term))
-                if future is not None:
-                    store_attempt(
-                        "indeed",
-                        query_group,
-                        search_term,
-                        future.result,
-                    )
-    except BaseException as error:
-        finalize(
-            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
-            [*errors, f"scraping: {type(error).__name__}: {error}"],
-        )
-        raise
-
-    unique_new_ids = list(dict.fromkeys(new_job_ids))
-    status = "completed_with_errors" if errors else "completed"
-    if errors and len(errors) == len(terms) * len(sources):
-        status = "failed"
-    enrichment = EnrichmentStats()
-    fatal_error: Exception | None = None
-    if process_queues:
-        try:
-            enrichment = process_enrichment(
-                queue, current_run_id=run_id, verbose_logging=verbose_logging,
-                max_seconds=config.ENRICHMENT_MAX_SECONDS,
-                api_call_limit=config.LLM_MAX_CALLS_PER_CYCLE,
-            )
-            fetch_tasks_created += enrichment.orphan_fetch_created
-            analysis_tasks_created += (
-                enrichment.orphan_analysis_created + enrichment.fetch.analysis_created
-            )
-        except KeyboardInterrupt as error:
-            finalize("interrupted", [*errors, f"enrichment: {type(error).__name__}: {error}"])
-            raise
-        except Exception as error:
-            fatal_error = error
-            errors.append(f"enrichment: {type(error).__name__}: {error}")
-            enrichment.fetch.errors.append(f"Enrichment worker failed: {error}")
-    try:
-        store.record_enrichment_summary(
-            run_id,
-            fetch_created=fetch_tasks_created,
-            fetch_completed=enrichment.fetch.completed,
-            fetch_retried=enrichment.fetch.retried,
-            fetch_dead=enrichment.fetch.dead,
-            analysis_created=analysis_tasks_created,
-            analysis_completed=enrichment.analysis.completed,
-            analysis_retried=enrichment.analysis.retried,
-            analysis_blocked=enrichment.analysis.budget_blocked,
-            analysis_dead=enrichment.analysis.dead,
-            calls=enrichment.analysis.calls,
-            input_tokens=enrichment.analysis.input_tokens,
-            output_tokens=enrichment.analysis.output_tokens,
-            estimated_cost=enrichment.analysis.estimated_cost,
-            errors=[*enrichment.fetch.errors, *enrichment.analysis.errors],
-            circuit_breakers=[enrichment.fetch.circuit_breaker,
-                              enrichment.analysis.circuit_breaker],
-        )
-    except KeyboardInterrupt as error:
-        finalize("interrupted", [*errors, f"enrichment summary: {type(error).__name__}: {error}"])
-        raise
-    except Exception as error:
-        if fatal_error is None:
-            fatal_error = error
-        errors.append(f"enrichment summary: {type(error).__name__}: {error}")
-    try:
-        current_export, new_export = export_all(
-            store, export_dir, unique_new_ids, run_started,
-        )
-    except BaseException as error:
-        export_error = f"export: {type(error).__name__}: {error}"
-        finalize(
-            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
-            [*errors, export_error],
-        )
-        raise
-    if fatal_error is not None:
-        finalize("failed", errors)
-        raise RuntimeError("Scrape cycle failed during enrichment; exports were written") from fatal_error
-    # A run is complete only after enrichment and exports finish. This makes
-    # finished_at represent the full cycle instead of the source searches alone.
-    finalize(status, errors)
-    return RunSummary(
-        run_id,
-        raw_count,
-        accepted_count,
-        excluded_count,
-        unmatched_count,
-        duplicate_count,
-        tuple(unique_new_ids),
-        tuple(errors),
-        current_export,
-        new_export,
-        enrichment,
-        fetch_tasks_created,
-        analysis_tasks_created,
-    )
+def run_scrape_cycle(*args, **kwargs) -> RunSummary:
+    """Compatibility wrapper for the pipeline's public scrape entry point."""
+    kwargs.setdefault("enrichment_processor", process_enrichment)
+    kwargs.setdefault("exporter", export_all)
+    kwargs.setdefault("queue_factory", EnrichmentQueue)
+    return _run_scrape_cycle(*args, **kwargs)
 
 
 def _print_summary(summary: RunSummary, *, enrichment_skipped: bool = False) -> None:
@@ -474,7 +76,8 @@ def _print_summary(summary: RunSummary, *, enrichment_skipped: bool = False) -> 
         print("Enrichment window reached; remaining work stays queued.")
     if summary.enrichment.remaining_tasks:
         remaining = ", ".join(
-            f"{key}={value}" for key, value in sorted(summary.enrichment.remaining_tasks.items())
+            f"{key}={value}"
+            for key, value in sorted(summary.enrichment.remaining_tasks.items())
         )
         print(f"Enrichment remaining: {remaining}")
     for error in [*fetch.errors, *analysis.errors]:
@@ -509,7 +112,9 @@ def run_command(args: argparse.Namespace) -> int:
         while True:
             print(f"Starting scrape at {datetime.now():%Y-%m-%d %H:%M:%S}")
             summary = run_scrape_cycle(
-                store, lookback, export_dir=args.output_dir,
+                store,
+                lookback,
+                export_dir=args.output_dir,
                 verbose_logging=args.verbose or config.VERBOSE_LOGGING,
                 process_queues=not args.no_enrichment,
             )
@@ -570,8 +175,10 @@ def queue_command(args: argparse.Namespace) -> int:
         print(f"{'ID':>5}  {'TYPE':<20} {'STATUS':<14} {'TRY':>3} {'JOB':>5}  ERROR")
         for task in tasks:
             error = task["last_error_message"] or ""
-            print(f"{task['id']:>5}  {task['task_type']:<20} {task['status']:<14} "
-                  f"{task['attempt_count']:>3} {task['job_id']:>5}  {error[:60]}")
+            print(
+                f"{task['id']:>5}  {task['task_type']:<20} {task['status']:<14} "
+                f"{task['attempt_count']:>3} {task['job_id']:>5}  {error[:60]}"
+            )
     else:
         rows = queue.queue_summary()
         if not rows:
@@ -607,21 +214,28 @@ def enrich_command(args: argparse.Namespace) -> int:
     verbose_logging = args.verbose or config.VERBOSE_LOGGING
     _configure_verbose_logging(verbose_logging)
     stats = process_enrichment(
-        queue, fetch_limit=args.limit, analysis_limit=args.limit,
-        fetch_only=args.fetch_only, verbose_logging=verbose_logging,
+        queue,
+        fetch_limit=args.limit,
+        analysis_limit=args.limit,
+        fetch_only=args.fetch_only,
+        verbose_logging=verbose_logging,
     )
     if stats.orphan_fetch_created or stats.orphan_analysis_created:
         print(
             f"Orphan repair: fetch created={stats.orphan_fetch_created}, "
             f"analysis created={stats.orphan_analysis_created}"
         )
-    print(f"Fetch: claimed={stats.fetch.claimed}, completed={stats.fetch.completed}, "
-          f"retry={stats.fetch.retried}, dead={stats.fetch.dead}")
+    print(
+        f"Fetch: claimed={stats.fetch.claimed}, completed={stats.fetch.completed}, "
+        f"retry={stats.fetch.retried}, dead={stats.fetch.dead}"
+    )
     if not args.fetch_only:
-        print(f"Analysis: claimed={stats.analysis.claimed}, completed={stats.analysis.completed}, "
-              f"retry={stats.analysis.retried}, blocked={stats.analysis.budget_blocked}, "
-              f"dead={stats.analysis.dead}, repairs={stats.analysis.repair_attempts}, "
-              f"calls={stats.analysis.calls}")
+        print(
+            f"Analysis: claimed={stats.analysis.claimed}, completed={stats.analysis.completed}, "
+            f"retry={stats.analysis.retried}, blocked={stats.analysis.budget_blocked}, "
+            f"dead={stats.analysis.dead}, repairs={stats.analysis.repair_attempts}, "
+            f"calls={stats.analysis.calls}"
+        )
     print(f"Enrichment elapsed: {stats.elapsed_seconds:.1f}s")
     if stats.remaining_tasks:
         remaining = ", ".join(
@@ -665,9 +279,11 @@ def show_command(args: argparse.Namespace) -> int:
     if not details["requirements"]:
         print("Requirements: not analyzed")
     for requirement in details["requirements"]:
-        print(f"- posting {requirement['posting_id']} ({requirement['source']}) "
-              f"{requirement['requirement_type']} [{requirement['priority']}]: "
-              f"{requirement['canonical_value']} — {requirement['evidence']}")
+        print(
+            f"- posting {requirement['posting_id']} ({requirement['source']}) "
+            f"{requirement['requirement_type']} [{requirement['priority']}]: "
+            f"{requirement['canonical_value']} — {requirement['evidence']}"
+        )
     return 0
 
 
@@ -688,13 +304,17 @@ def usage_command(args: argparse.Namespace) -> int:
         if not rows:
             print("No outstanding reservations.")
         for row in rows:
-            print(f"{row['reservation_token']} task={row['task_id']} month={row['month_key']} "
-                  f"status={row['status']} projected=${row['projected_cost_usd']:.6f}")
+            print(
+                f"{row['reservation_token']} task={row['task_id']} month={row['month_key']} "
+                f"status={row['status']} projected=${row['projected_cost_usd']:.6f}"
+            )
     usage = queue.usage(args.month)
     remaining = max(0.0, config.LLM_MONTHLY_BUDGET_USD - usage["cost"])
-    print(f"{usage['month']}: calls={usage['calls']}, input={usage['input_tokens']}, "
-          f"output={usage['output_tokens']}, counted=${usage['cost']:.6f}, "
-          f"remaining=${remaining:.6f}")
+    print(
+        f"{usage['month']}: calls={usage['calls']}, input={usage['input_tokens']}, "
+        f"output={usage['output_tokens']}, counted=${usage['cost']:.6f}, "
+        f"remaining=${remaining:.6f}"
+    )
     return 0
 
 
@@ -712,8 +332,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fetch, filter, store, and export jobs without processing enrichment",
     )
-    run_parser.add_argument("--verbose", action="store_true",
-                            help="Log scrape and enrichment timing details")
+    run_parser.add_argument(
+        "--verbose", action="store_true", help="Log scrape and enrichment timing details"
+    )
     run_parser.set_defaults(handler=run_command)
 
     list_parser = subparsers.add_parser("list", help="List stored jobs")
@@ -744,11 +365,13 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_parser.add_argument("--limit", type=_positive_int, default=20)
     enrich_parser.add_argument("--fetch-only", action="store_true")
     enrich_parser.add_argument(
-        "--migrate-existing", action="store_true",
+        "--migrate-existing",
+        action="store_true",
         help="Backfill missing enrichment tasks for all eligible stored jobs",
     )
-    enrich_parser.add_argument("--verbose", action="store_true",
-                              help="Log enrichment timing details")
+    enrich_parser.add_argument(
+        "--verbose", action="store_true", help="Log enrichment timing details"
+    )
     enrich_parser.set_defaults(handler=enrich_command)
 
     show_parser = subparsers.add_parser("show", help="Show a job and extracted requirements")
@@ -757,12 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     usage_parser = subparsers.add_parser("usage", help="Show monthly OpenAI usage")
     usage_parser.add_argument("--month", help="UTC month in YYYY-MM format")
-    usage_parser.add_argument("--outstanding", action="store_true",
-                              help="List reserved or uncertain API calls")
-    usage_parser.add_argument("--resolve", metavar="TOKEN",
-                              help="Resolve an outstanding usage reservation")
-    usage_parser.add_argument("--actual-cost", type=float,
-                              help="Actual USD cost used with --resolve")
+    usage_parser.add_argument("--outstanding", action="store_true", help="List reserved or uncertain API calls")
+    usage_parser.add_argument("--resolve", metavar="TOKEN", help="Resolve an outstanding usage reservation")
+    usage_parser.add_argument("--actual-cost", type=float, help="Actual USD cost used with --resolve")
     usage_parser.set_defaults(handler=usage_command)
     return parser
 

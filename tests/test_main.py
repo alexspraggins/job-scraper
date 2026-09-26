@@ -102,6 +102,39 @@ def test_scrape_cycle_isolates_source_failure_and_records_counts(tmp_path):
     assert store.get_run(summary.run_id)["status"] == "completed_with_errors"
 
 
+def test_scrape_cycle_reports_jobspy_logged_source_failure(tmp_path):
+    def fake_scraper(**kwargs):
+        if kwargs["site_name"] == ["linkedin"]:
+            logging.getLogger("jobspy-test").error("DNS unavailable")
+            return pd.DataFrame()
+        return pd.DataFrame([{
+            "id": "1",
+            "site": "indeed",
+            "job_url": "https://example.com/1",
+            "title": "Junior Software Engineer",
+            "company": "Example",
+            "location": "Remote",
+        }])
+
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    summary = run_scrape_cycle(
+        store,
+        24,
+        search_groups={"core_software": ["software engineer"]},
+        sources=["indeed", "linkedin"],
+        scraper=fake_scraper,
+        query_delay_seconds=0,
+        source_timeout_seconds=0,
+        export_dir=tmp_path / "exports",
+        process_queues=False,
+    )
+
+    assert len(summary.new_job_ids) == 1
+    assert len(summary.errors) == 1
+    assert "linkedin/core_software/software engineer: DNS unavailable" in summary.errors[0]
+    assert store.get_run(summary.run_id)["status"] == "completed_with_errors"
+
+
 def test_repeated_cycle_creates_no_duplicate_canonical_job(tmp_path):
     def fake_scraper(**kwargs):
         return pd.DataFrame(
@@ -241,6 +274,37 @@ def test_default_searches_have_fifteen_representatives_across_all_families():
     assert len(config.SEARCH_GROUPS) == 9
     assert sum(map(len, config.SEARCH_GROUPS.values())) == 15
     assert set(config.SEARCH_GROUPS) == set(config.ROLE_TERMS)
+    assert config.SOURCES == ["indeed", "linkedin", "glassdoor"]
+
+
+def test_glassdoor_results_use_the_normal_pipeline(tmp_path):
+    def fake_scraper(**kwargs):
+        assert kwargs["site_name"] == ["glassdoor"]
+        return pd.DataFrame([{
+            "id": "glassdoor-1",
+            "site": "glassdoor",
+            "job_url": "https://example.com/glassdoor-1",
+            "title": "Junior Software Engineer",
+            "company": "Example",
+            "location": "Remote",
+        }])
+
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    summary = run_scrape_cycle(
+        store,
+        24,
+        search_groups={"core_software": ["software engineer"]},
+        sources=["glassdoor"],
+        scraper=fake_scraper,
+        query_delay_seconds=0,
+        source_timeout_seconds=0,
+        export_dir=tmp_path / "exports",
+        process_queues=False,
+    )
+
+    assert summary.errors == ()
+    assert len(summary.new_job_ids) == 1
+    assert store.get_job_details(summary.new_job_ids[0])["postings"][0]["source"] == "glassdoor"
 
 
 def empty_cycle_options(tmp_path):
@@ -395,6 +459,21 @@ def test_run_command_returns_clean_nonzero_for_cycle_failure(monkeypatch, capsys
 
     assert main(["run", "--once"]) == 1
     assert "Scrape failed: cycle failed" in capsys.readouterr().err
+
+
+def test_run_once_returns_nonzero_for_partial_source_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        main_module,
+        "run_scrape_cycle",
+        lambda *_args, **_kwargs: SimpleNamespace(errors=("linkedin failed",)),
+    )
+    monkeypatch.setattr(main_module, "_print_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main_module, "_email_new_jobs", lambda *_args: None)
+
+    assert main([
+        "--database", str(tmp_path / "jobs.sqlite3"),
+        "run", "--once", "--no-enrichment",
+    ]) == 1
 
 
 def test_run_no_enrichment_skips_queue_processing(tmp_path, monkeypatch):

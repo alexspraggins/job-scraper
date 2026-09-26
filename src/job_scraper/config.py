@@ -237,8 +237,7 @@ ENTRY_LEVEL_TERMS = [
     "developer i",
 ]
 
-SOURCES = ["indeed", "linkedin"]
-SKILLSIRE_ENABLED = False
+SOURCES = ["indeed", "linkedin", "glassdoor"]
 COUNTRY = "USA"
 LOCATION = "United States"
 RESULTS_PER_QUERY = 15
@@ -246,8 +245,8 @@ INITIAL_LOOKBACK_HOURS = 24
 RECURRING_LOOKBACK_HOURS = 2
 QUERY_DELAY_SECONDS = 2
 SOURCE_TIMEOUT_SECONDS = 45
-# Indeed queries run in a small parallel pool while LinkedIn stays serial. This
-# overlaps the two sources without increasing LinkedIn's request rate.
+# Indeed queries run in a small parallel pool while LinkedIn and Glassdoor stay
+# serial. This overlaps Indeed without increasing the other source request rate.
 INDEED_MAX_WORKERS = max(1, _env_int("JOB_SCRAPER_INDEED_MAX_WORKERS", 3))
 POLL_INTERVAL_SECONDS = 3600
 
