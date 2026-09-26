@@ -1,4 +1,5 @@
 import csv
+from datetime import datetime, timedelta, timezone
 import re
 
 import pytest
@@ -55,6 +56,126 @@ def test_empty_new_job_ids_do_not_create_run_export(tmp_path):
     current_path, run_path = export_all(store, tmp_path / "exports", [])
     assert current_path.exists()
     assert run_path is None
+    with current_path.open(newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == EXPORT_COLUMNS
+        assert list(reader) == []
+
+
+def add_dated_job(
+    store,
+    *,
+    source_id,
+    date_posted,
+    first_seen_at,
+    last_seen_at,
+):
+    job_id, _ = store.upsert_job(
+        {
+            "id": source_id,
+            "site": "indeed",
+            "job_url": f"https://example.com/{source_id}",
+            "title": f"Software Engineer {source_id}",
+            "company": "Example",
+            "location": "Remote",
+            "date_posted": date_posted,
+            "role_family": "core_software",
+            "seniority": "entry",
+            "matched_terms": ["software engineer"],
+        },
+        query_group="core_software",
+        search_term="software engineer",
+    )
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE jobs SET first_seen_at=?, last_seen_at=? WHERE id=?",
+            (first_seen_at, last_seen_at, job_id),
+        )
+    return job_id
+
+
+def test_current_export_uses_hybrid_24_hour_freshness(tmp_path):
+    now = datetime(2026, 9, 26, 12, tzinfo=timezone.utc)
+    recent = (now - timedelta(hours=2)).isoformat()
+    old = (now - timedelta(hours=25)).isoformat()
+    store = JobStore(tmp_path / "jobs.sqlite3")
+
+    precise_recent = add_dated_job(
+        store,
+        source_id="precise-recent",
+        date_posted=recent,
+        first_seen_at=old,
+        last_seen_at=now.isoformat(),
+    )
+    precise_old = add_dated_job(
+        store,
+        source_id="precise-old",
+        date_posted=old,
+        first_seen_at=recent,
+        last_seen_at=now.isoformat(),
+    )
+    missing_recent = add_dated_job(
+        store,
+        source_id="missing-recent",
+        date_posted=None,
+        first_seen_at=recent,
+        last_seen_at=now.isoformat(),
+    )
+    date_only_old = add_dated_job(
+        store,
+        source_id="date-only-old",
+        date_posted="2026-09-26",
+        first_seen_at=old,
+        last_seen_at=now.isoformat(),
+    )
+    date_only_recent = add_dated_job(
+        store,
+        source_id="date-only-recent",
+        date_posted="2026-09-26",
+        first_seen_at=recent,
+        last_seen_at=now.isoformat(),
+    )
+    malformed_old = add_dated_job(
+        store,
+        source_id="malformed-old",
+        date_posted="not-a-date",
+        first_seen_at=old,
+        last_seen_at=now.isoformat(),
+    )
+    malformed_recent = add_dated_job(
+        store,
+        source_id="malformed-recent",
+        date_posted="not-a-date",
+        first_seen_at=recent,
+        last_seen_at=now.isoformat(),
+    )
+
+    current_path, new_path = export_all(
+        store,
+        tmp_path / "exports",
+        [precise_old],
+        timestamp=now,
+        current_time=now,
+    )
+    with current_path.open(newline="", encoding="utf-8") as csv_file:
+        current_ids = {int(row["id"]) for row in csv.DictReader(csv_file)}
+    with new_path.open(newline="", encoding="utf-8") as csv_file:
+        new_ids = {int(row["id"]) for row in csv.DictReader(csv_file)}
+
+    assert current_ids == {
+        precise_recent,
+        missing_recent,
+        date_only_recent,
+        malformed_recent,
+    }
+    assert precise_old not in current_ids
+    assert date_only_old not in current_ids
+    assert malformed_old not in current_ids
+    assert precise_old in new_ids
+
+    assert precise_old in {row["id"] for row in store.list_jobs()}
+    assert store.get_job_details(precise_old)["job"]["id"] == precise_old
+    assert precise_old in {row["id"] for row in store.export_rows()}
 
 
 def add_posting(store, *, source, source_id, description=None):

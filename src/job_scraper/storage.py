@@ -60,6 +60,38 @@ def clean_value(value: object) -> object | None:
     return value
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Normalize a timestamp for comparisons with the UTC database clock."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_precise_timestamp(value: object) -> datetime | None:
+    """Parse timestamps while rejecting date-only values as imprecise."""
+    cleaned = clean_value(value)
+    if cleaned is None:
+        return None
+    if isinstance(cleaned, datetime):
+        return _as_utc(cleaned)
+    text = str(cleaned).strip()
+    if not text or re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _as_utc(parsed)
+
+
+def _is_current_job(row: dict, cutoff: datetime) -> bool:
+    """Return whether a job belongs in the rolling current-jobs view."""
+    posted_at = _parse_precise_timestamp(row.get("date_posted"))
+    first_seen_at = _parse_precise_timestamp(row.get("first_seen_at"))
+    effective_at = posted_at or first_seen_at
+    return effective_at is not None and effective_at >= cutoff
+
+
 def normalize_url(value: object) -> str:
     url = str(clean_value(value) or "").strip()
     if not url:
@@ -615,7 +647,12 @@ class JobStore:
         with self.connect() as connection:
             return list(connection.execute(query, parameters).fetchall())
 
-    def export_rows(self, job_ids: list[int] | None = None) -> list[dict]:
+    def export_rows(
+        self,
+        job_ids: list[int] | None = None,
+        *,
+        fresh_since: datetime | None = None,
+    ) -> list[dict]:
         clauses = ["j.eligible = 1", "j.status != 'rejected'"]
         parameters: list[object] = []
         if job_ids is not None:
@@ -651,6 +688,9 @@ class JobStore:
         """
         with self.connect() as connection:
             rows = [dict(row) for row in connection.execute(query, parameters).fetchall()]
+            if fresh_since is not None:
+                cutoff = _as_utc(fresh_since)
+                rows = [row for row in rows if _is_current_job(row, cutoff)]
             selected_ids = [row["id"] for row in rows]
             requirements_by_job = self._current_requirements(connection, selected_ids)
             postings_by_job = self._posting_states(connection, selected_ids)

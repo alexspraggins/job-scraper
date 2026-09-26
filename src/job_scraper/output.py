@@ -1,7 +1,7 @@
 """Deterministic CSV exports derived from the SQLite store."""
 
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -31,6 +31,7 @@ EXPORT_COLUMNS = [
     "analysis_status",
     "notes",
 ]
+CURRENT_JOBS_LOOKBACK = timedelta(hours=24)
 
 
 def _compensation(row: dict) -> str:
@@ -82,8 +83,18 @@ def write_csv(path: str | Path, rows: list[dict]) -> Path:
     return target
 
 
-def export_current_jobs(store: JobStore, export_dir: str | Path) -> Path:
-    return write_csv(Path(export_dir) / "current-jobs.csv", store.export_rows())
+def export_current_jobs(
+    store: JobStore,
+    export_dir: str | Path,
+    *,
+    current_time: datetime | None = None,
+) -> Path:
+    current_time = current_time or datetime.now(timezone.utc)
+    fresh_since = current_time - CURRENT_JOBS_LOOKBACK
+    return write_csv(
+        Path(export_dir) / "current-jobs.csv",
+        store.export_rows(fresh_since=fresh_since),
+    )
 
 
 def export_new_jobs(
@@ -104,8 +115,10 @@ def export_all(
     export_dir: str | Path,
     new_job_ids: list[int] | None = None,
     timestamp: datetime | None = None,
+    *,
+    current_time: datetime | None = None,
 ) -> tuple[Path, Path | None]:
     store.reclassify_jobs()
-    current_path = export_current_jobs(store, export_dir)
+    current_path = export_current_jobs(store, export_dir, current_time=current_time)
     run_path = export_new_jobs(store, export_dir, new_job_ids or [], timestamp)
     return current_path, run_path
