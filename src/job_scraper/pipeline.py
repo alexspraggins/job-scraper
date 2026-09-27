@@ -239,8 +239,8 @@ def run_scrape_cycle(
                         timeout_seconds=source_timeout,
                     )
 
-            # LinkedIn, Glassdoor, and future non-Indeed adapters remain in one
-            # serial lane so adding a source cannot increase their request rate.
+            # LinkedIn and future non-Indeed adapters remain in one serial lane
+            # so adding a source cannot increase their request rate.
             for term_index, (query_group, search_term) in enumerate(terms):
                 for source in serial_sources:
                     request = SourceRequest(source, search_term, lookback_hours)

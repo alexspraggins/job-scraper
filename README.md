@@ -1,6 +1,6 @@
 # Job Scraper
 
-Job Scraper searches Indeed, LinkedIn, and Glassdoor for early-career software roles,
+Job Scraper searches Indeed and LinkedIn for early-career software roles,
 filters and deduplicates the results, stores them in SQLite, optionally
 extracts requirements with OpenAI, and writes readable CSV exports.
 
@@ -23,7 +23,7 @@ separate public-description fetch, then queued for analysis.
 
 - Python 3.14 or newer
 - [`uv`](https://docs.astral.sh/uv/)
-- Network access for live Indeed/LinkedIn/Glassdoor searches
+- Network access for live Indeed/LinkedIn searches
 - An OpenAI API key only if LLM enrichment is enabled
 
 ### Install and test
@@ -98,8 +98,7 @@ uv run job-scraper run
 
 The first continuous cycle uses the 24-hour lookback. Later cycles run hourly
 with a two-hour overlapping lookback. Stop continuous mode with `Ctrl+C`.
-Indeed searches run in a small parallel pool; LinkedIn and Glassdoor run in a
-serial lane, so enabling the third default source increases coverage and runtime.
+Indeed searches run in a small parallel pool; LinkedIn runs in a serial lane.
 
 For a different one-time lookback:
 
@@ -423,7 +422,7 @@ not need email credentials unless email notifications are enabled.
 
 | Variable | Default | Description |
 |---|---:|---|
-| `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Concurrent Indeed search workers. LinkedIn and Glassdoor remain serial. |
+| `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Concurrent Indeed search workers. LinkedIn remains serial. |
 | `JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT` | `50` | Maximum LinkedIn fetches per automatic cycle. |
 
 ### OpenAI enrichment
@@ -486,10 +485,16 @@ Each run reports raw, accepted, excluded, unmatched, duplicate, new, and error
 counts. A failure from one source or query does not discard successful results
 from other attempts.
 
-Live sources are isolated behind a common adapter boundary. Skillsire is no
-longer a live source, although historical Skillsire postings remain readable
-in SQLite. Dice is not included yet, but can be added as another adapter
-without changing filtering, storage, enrichment, or exports.
+Live sources are isolated behind a common adapter boundary. The supported live
+sources are Indeed and LinkedIn. Skillsire is no longer a live source, although
+historical Skillsire postings remain readable in SQLite. Dice is not included
+yet, but can be added as another adapter without changing filtering, storage,
+enrichment, or exports.
+
+Glassdoor was intentionally removed because JobSpy's Glassdoor location
+endpoint is unstable and repeatedly returns HTTP 400, 403, or 404 responses.
+Existing Glassdoor data was purged during this cleanup. There is no Glassdoor
+configuration flag or live-source option.
 
 ## Data and outputs
 

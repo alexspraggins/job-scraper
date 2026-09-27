@@ -12,7 +12,7 @@ from job_scraper.sources import (
 )
 
 
-@pytest.mark.parametrize("source", ["indeed", "linkedin", "glassdoor"])
+@pytest.mark.parametrize("source", ["indeed", "linkedin"])
 def test_jobspy_adapter_uses_one_common_request_contract(source):
     captured = {}
 
@@ -34,8 +34,13 @@ def test_jobspy_adapter_uses_one_common_request_contract(source):
 
 
 def test_source_registry_contains_default_jobspy_sources():
-    assert JOBSPY_SOURCES == {"indeed", "linkedin", "glassdoor"}
-    validate_sources(["indeed", "linkedin", "glassdoor"])
+    assert JOBSPY_SOURCES == {"indeed", "linkedin"}
+    validate_sources(["indeed", "linkedin"])
+
+
+def test_glassdoor_is_rejected_as_an_unsupported_source():
+    with pytest.raises(ValueError, match="Unsupported source.*glassdoor"):
+        validate_sources(["glassdoor"])
 
 
 def test_skillsire_is_not_a_live_source():
@@ -48,12 +53,12 @@ def test_source_attempt_reports_failures_with_request_context():
         raise RuntimeError("blocked")
 
     result = run_source_attempt(
-        SourceRequest("glassdoor", "software engineer", 24),
+        SourceRequest("linkedin", "software engineer", 24),
         scraper=failing_scraper,
         timeout_seconds=0,
     )
 
-    assert result.request.source == "glassdoor"
+    assert result.request.source == "linkedin"
     assert result.request.search_term == "software engineer"
     assert result.jobs.empty
     assert result.error == "RuntimeError: blocked"

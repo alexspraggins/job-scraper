@@ -33,7 +33,7 @@ def seed_job(database: Path) -> int:
     job_id, _ = store.upsert_job(
         {
             "id": "system-job",
-            "site": "glassdoor",
+            "site": "indeed",
             "job_url": "https://example.com/system-job",
             "title": "Junior Software Engineer",
             "company": "Example",

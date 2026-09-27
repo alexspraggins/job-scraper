@@ -15,7 +15,7 @@ from jobspy import scrape_jobs
 from . import config
 
 
-JOBSPY_SOURCES = frozenset({"indeed", "linkedin", "glassdoor"})
+JOBSPY_SOURCES = frozenset({"indeed", "linkedin"})
 
 
 @dataclass(frozen=True)
