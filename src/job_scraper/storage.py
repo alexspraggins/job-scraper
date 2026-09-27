@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import shutil
 from typing import Iterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -16,8 +17,15 @@ from . import config
 from .filtering import classify_title, normalize_text
 
 
-SCHEMA_VERSION = 3
-VALID_STATUSES = ("new", "reviewed", "saved", "applied", "rejected")
+SCHEMA_VERSION = 4
+APPLICATION_STATUSES = (
+    "applied",
+    "interviewing",
+    "offer",
+    "accepted",
+    "rejected",
+    "withdrawn",
+)
 ANALYSIS_STATUS_PRIORITY = {
     "dead": 0,
     "unavailable": 1,
@@ -147,6 +155,18 @@ class JobStore:
             connection.close()
 
     def initialize(self) -> None:
+        existing_database = self.path.exists() and self.path.stat().st_size > 0
+        legacy_database = False
+        if existing_database:
+            with sqlite3.connect(self.path) as probe:
+                legacy_columns = {
+                    row[1] for row in probe.execute("PRAGMA table_info(jobs)")
+                }
+            legacy_database = bool(
+                {"status", "notes", "applied_at"}.intersection(legacy_columns)
+            )
+            if legacy_database:
+                self._backup_before_application_migration()
         with self.connect() as connection:
             connection.executescript(
                 """
@@ -169,14 +189,10 @@ class JobStore:
                     seniority TEXT NOT NULL,
                     eligible INTEGER NOT NULL DEFAULT 1,
                     eligibility_reason TEXT NOT NULL DEFAULT 'accepted',
-                    status TEXT NOT NULL DEFAULT 'new'
-                        CHECK (status IN ('new', 'reviewed', 'saved', 'applied', 'rejected')),
-                    notes TEXT NOT NULL DEFAULT '',
                     date_posted TEXT,
                     first_seen_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    applied_at TEXT
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS postings (
@@ -252,16 +268,6 @@ class JobStore:
                     error TEXT
                 );
 
-                CREATE TABLE IF NOT EXISTS status_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-                    old_status TEXT,
-                    new_status TEXT NOT NULL,
-                    note TEXT,
-                    changed_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_jobs_last_seen ON jobs(last_seen_at);
                 CREATE INDEX IF NOT EXISTS idx_postings_job ON postings(job_id);
                 CREATE INDEX IF NOT EXISTS idx_postings_url ON postings(normalized_url);
@@ -282,6 +288,7 @@ class JobStore:
                     NOT NULL DEFAULT 'accepted'
                     """
                 )
+            self._migrate_application_schema(connection, job_columns)
             run_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(scrape_runs)")
             }
@@ -322,6 +329,143 @@ class JobStore:
                 """,
                 (utc_now(),),
             )
+
+    def _backup_before_application_migration(self) -> Path:
+        backup_path = self.path.with_name(
+            f"{self.path.name}.pre-application-migration.bak"
+        )
+        if not backup_path.exists():
+            shutil.copy2(self.path, backup_path)
+        return backup_path
+
+    @staticmethod
+    def _create_application_tables(connection: sqlite3.Connection) -> None:
+        statuses = ", ".join(f"'{status}'" for status in APPLICATION_STATUSES)
+        connection.executescript(
+            f"""
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ({statuses})),
+                notes TEXT NOT NULL DEFAULT '',
+                applied_at TEXT,
+                interviewing_at TEXT,
+                offer_at TEXT,
+                accepted_at TEXT,
+                rejected_at TEXT,
+                withdrawn_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS application_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+                old_status TEXT,
+                new_status TEXT NOT NULL CHECK (new_status IN ({statuses})),
+                note TEXT,
+                changed_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_applications_status
+                ON applications(status);
+            CREATE INDEX IF NOT EXISTS idx_application_events_application
+                ON application_events(application_id, changed_at, id);
+            """
+        )
+
+    def _migrate_application_schema(
+        self,
+        connection: sqlite3.Connection,
+        job_columns: set[str],
+    ) -> None:
+        """Create the application model and remove legacy job workflow columns."""
+        self._create_application_tables(connection)
+        if not {"status", "notes", "applied_at"}.intersection(job_columns):
+            return
+
+        legacy_rows = [dict(row) for row in connection.execute(
+            """
+            SELECT id, status, notes, applied_at, first_seen_at
+            FROM jobs
+            WHERE status = 'applied'
+            """
+        ).fetchall()]
+
+        connection.execute("DROP TABLE IF EXISTS status_history")
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            """
+            CREATE TABLE jobs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                company TEXT,
+                normalized_company TEXT NOT NULL,
+                location TEXT,
+                normalized_location TEXT NOT NULL,
+                is_remote INTEGER,
+                role_family TEXT NOT NULL,
+                seniority TEXT NOT NULL,
+                eligible INTEGER NOT NULL DEFAULT 1,
+                eligibility_reason TEXT NOT NULL DEFAULT 'accepted',
+                date_posted TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO jobs_new(
+                id, fingerprint, title, normalized_title, company, normalized_company,
+                location, normalized_location, is_remote, role_family, seniority,
+                eligible, eligibility_reason, date_posted, first_seen_at,
+                last_seen_at, updated_at
+            )
+            SELECT id, fingerprint, title, normalized_title, company, normalized_company,
+                   location, normalized_location, is_remote, role_family, seniority,
+                   eligible, eligibility_reason, date_posted, first_seen_at,
+                   last_seen_at, updated_at
+            FROM jobs
+            """
+        )
+        connection.execute("DROP TABLE jobs")
+        connection.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jobs_last_seen ON jobs(last_seen_at);
+            CREATE INDEX IF NOT EXISTS idx_postings_job ON postings(job_id);
+            CREATE INDEX IF NOT EXISTS idx_postings_url ON postings(normalized_url);
+            CREATE INDEX IF NOT EXISTS idx_attempts_run ON scrape_attempts(run_id);
+            """
+        )
+        for row in legacy_rows:
+            applied_at = row["applied_at"] or row["first_seen_at"]
+            created_at = applied_at or utc_now()
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO applications(
+                    job_id, status, notes, applied_at, created_at, updated_at
+                ) VALUES (?, 'applied', ?, ?, ?, ?)
+                """,
+                (row["id"], row["notes"] or "", applied_at, created_at, created_at),
+            )
+            application = connection.execute(
+                "SELECT id FROM applications WHERE job_id = ?", (row["id"],)
+            ).fetchone()
+            if cursor.rowcount == 1 and application is not None:
+                connection.execute(
+                    """
+                    INSERT INTO application_events(
+                        application_id, old_status, new_status, note, changed_at
+                    ) VALUES (?, NULL, 'applied', ?, ?)
+                    """,
+                    (application["id"], row["notes"] or None, created_at),
+                )
 
     def start_run(self, lookback_hours: int) -> int:
         with self.connect() as connection:
@@ -563,40 +707,79 @@ class JobStore:
 
         return job_id, is_new
 
-    def set_status(self, job_id: int, new_status: str, note: str | None = None) -> None:
-        if new_status not in VALID_STATUSES:
-            raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}")
+    def create_application(
+        self, job_id: int, note: str | None = None,
+    ) -> tuple[dict, bool]:
         now = utc_now()
         with self.connect() as connection:
             job = connection.execute(
-                "SELECT status FROM jobs WHERE id = ?",
-                (job_id,),
+                "SELECT id FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             if job is None:
                 raise KeyError(f"Job {job_id} was not found")
-            applied_at = now if new_status == "applied" else None
+            existing = connection.execute(
+                "SELECT * FROM applications WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if existing is not None:
+                return dict(existing), False
+            cursor = connection.execute(
+                """
+                INSERT INTO applications(
+                    job_id, status, notes, applied_at, created_at, updated_at
+                ) VALUES (?, 'applied', ?, ?, ?, ?)
+                """,
+                (job_id, note or "", now, now, now),
+            )
+            application_id = int(cursor.lastrowid)
             connection.execute(
                 """
-                UPDATE jobs SET status = ?, notes = COALESCE(?, notes),
-                    applied_at = COALESCE(?, applied_at), updated_at = ?
-                WHERE id = ?
+                INSERT INTO application_events(
+                    application_id, old_status, new_status, note, changed_at
+                ) VALUES (?, NULL, 'applied', ?, ?)
                 """,
-                (new_status, note, applied_at, now, job_id),
+                (application_id, note, now),
+            )
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            return dict(application), True
+
+    def set_application_status(
+        self, job_id: int, new_status: str, note: str | None = None,
+    ) -> dict:
+        if new_status not in APPLICATION_STATUSES:
+            raise ValueError(
+                f"Application status must be one of: {', '.join(APPLICATION_STATUSES)}"
+            )
+        now = utc_now()
+        date_column = f"{new_status}_at"
+        with self.connect() as connection:
+            application = connection.execute(
+                "SELECT * FROM applications WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError(f"Application for job {job_id} was not found")
+            connection.execute(
+                f"""
+                UPDATE applications
+                SET status = ?, notes = COALESCE(?, notes),
+                    {date_column} = COALESCE({date_column}, ?), updated_at = ?
+                WHERE job_id = ?
+                """,
+                (new_status, note, now, now, job_id),
             )
             connection.execute(
                 """
-                INSERT INTO status_history(job_id, old_status, new_status, note, changed_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO application_events(
+                    application_id, old_status, new_status, note, changed_at
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (job_id, job["status"], new_status, note, now),
+                (application["id"], application["status"], new_status, note, now),
             )
-            if new_status == "rejected":
-                connection.execute(
-                    """UPDATE enrichment_tasks SET status='cancelled', updated_at=?
-                       WHERE posting_id IN (SELECT id FROM postings WHERE job_id=?)
-                         AND status IN ('pending','retry','leased','budget_blocked')""",
-                    (now, job_id),
-                )
+            updated = connection.execute(
+                "SELECT * FROM applications WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return dict(updated)
 
     def reclassify_jobs(self) -> tuple[int, int]:
         """Reapply current title rules without deleting jobs or workflow history."""
@@ -634,16 +817,13 @@ class JobStore:
                     )
         return eligible_count, ineligible_count
 
-    def list_jobs(self, status: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
-        query = "SELECT id, status, title, company, location, date_posted FROM jobs"
-        parameters: list[object] = []
-        if status:
-            if status not in VALID_STATUSES:
-                raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}")
-            query += " WHERE status = ?"
-            parameters.append(status)
-        query += " ORDER BY COALESCE(date_posted, first_seen_at) DESC, id DESC LIMIT ?"
-        parameters.append(limit)
+    def list_jobs(self, limit: int = 50) -> list[sqlite3.Row]:
+        query = """
+            SELECT id, title, company, location, date_posted
+            FROM jobs
+            ORDER BY COALESCE(date_posted, first_seen_at) DESC, id DESC LIMIT ?
+        """
+        parameters: list[object] = [limit]
         with self.connect() as connection:
             return list(connection.execute(query, parameters).fetchall())
 
@@ -653,7 +833,7 @@ class JobStore:
         *,
         fresh_since: datetime | None = None,
     ) -> list[dict]:
-        clauses = ["j.eligible = 1", "j.status != 'rejected'"]
+        clauses = ["j.eligible = 1"]
         parameters: list[object] = []
         if job_ids is not None:
             if not job_ids:
@@ -665,9 +845,9 @@ class JobStore:
 
         query = f"""
             SELECT
-                j.id, j.status, j.title, j.company, j.location, j.is_remote,
+                j.id, j.title, j.company, j.location, j.is_remote,
                 j.role_family, j.seniority, j.date_posted, j.first_seen_at,
-                j.last_seen_at, j.notes,
+                j.last_seen_at,
                 (SELECT group_concat(source, ', ')
                  FROM (SELECT DISTINCT source FROM postings WHERE job_id = j.id ORDER BY source)) AS sources,
                 (SELECT COALESCE(direct_url, job_url) FROM postings
@@ -680,10 +860,7 @@ class JobStore:
                  FROM (SELECT DISTINCT matched_term FROM job_matches WHERE job_id = j.id ORDER BY matched_term)) AS matched_terms
             FROM jobs j
             {where}
-            ORDER BY
-                CASE j.status WHEN 'new' THEN 0 WHEN 'saved' THEN 1 WHEN 'reviewed' THEN 2
-                    WHEN 'applied' THEN 3 ELSE 4 END,
-                COALESCE(j.date_posted, j.first_seen_at) DESC,
+            ORDER BY COALESCE(j.date_posted, j.first_seen_at) DESC,
                 j.id DESC
         """
         with self.connect() as connection:
@@ -717,6 +894,78 @@ class JobStore:
                     key=ANALYSIS_STATUS_PRIORITY.__getitem__,
                 )
             return rows
+
+    def list_applications(
+        self, status: str | None = None, limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        parameters: list[object] = []
+        query = """
+            SELECT a.id application_id, a.job_id, a.status, a.notes,
+                   a.applied_at, a.interviewing_at, a.offer_at,
+                   a.accepted_at, a.rejected_at, a.withdrawn_at,
+                   j.title, j.company, j.location, j.date_posted
+            FROM applications a
+            JOIN jobs j ON j.id = a.job_id
+        """
+        if status is not None:
+            if status not in APPLICATION_STATUSES:
+                raise ValueError(
+                    f"Application status must be one of: {', '.join(APPLICATION_STATUSES)}"
+                )
+            query += " WHERE a.status = ?"
+            parameters.append(status)
+        query += " ORDER BY a.updated_at DESC, a.id DESC LIMIT ?"
+        parameters.append(limit)
+        with self.connect() as connection:
+            return list(connection.execute(query, parameters).fetchall())
+
+    def export_application_rows(self, status: str | None = None) -> list[dict]:
+        parameters: list[object] = []
+        query = """
+            SELECT
+                j.id, a.id application_id, a.status application_status,
+                j.title, j.company, j.location, j.date_posted, j.first_seen_at,
+                a.applied_at, a.interviewing_at, a.offer_at, a.accepted_at,
+                a.rejected_at, a.withdrawn_at, a.notes application_notes,
+                a.updated_at application_updated_at,
+                (SELECT group_concat(source, ', ')
+                 FROM (SELECT DISTINCT source FROM postings
+                       WHERE job_id = j.id ORDER BY source)) AS sources,
+                (SELECT COALESCE(direct_url, job_url) FROM postings
+                 WHERE job_id = j.id
+                 ORDER BY CASE source WHEN 'linkedin' THEN 0 ELSE 1 END, id
+                 LIMIT 1) AS preferred_url
+            FROM applications a
+            JOIN jobs j ON j.id = a.job_id
+        """
+        if status is not None:
+            if status not in APPLICATION_STATUSES:
+                raise ValueError(
+                    f"Application status must be one of: {', '.join(APPLICATION_STATUSES)}"
+                )
+            query += " WHERE a.status = ?"
+            parameters.append(status)
+        query += " ORDER BY a.updated_at DESC, a.id DESC"
+        with self.connect() as connection:
+            return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+
+    def get_application_details(self, job_id: int) -> dict:
+        with self.connect() as connection:
+            application = connection.execute(
+                "SELECT * FROM applications WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError(f"Application for job {job_id} was not found")
+            events = connection.execute(
+                """
+                SELECT id, old_status, new_status, note, changed_at
+                FROM application_events
+                WHERE application_id = ?
+                ORDER BY changed_at, id
+                """,
+                (application["id"],),
+            ).fetchall()
+        return {"application": dict(application), "events": [dict(event) for event in events]}
 
     @staticmethod
     def _id_chunks(values: list[int], size: int = 500) -> Iterator[list[int]]:
@@ -858,7 +1107,27 @@ class JobStore:
                 raise KeyError(f"Job {job_id} was not found")
             postings = self._posting_states(connection, [job_id]).get(job_id, [])
             requirements = self._current_requirements(connection, [job_id]).get(job_id, [])
-        return {"job": dict(job), "postings": postings, "requirements": requirements}
+            application = connection.execute(
+                "SELECT * FROM applications WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            events = []
+            if application is not None:
+                events = connection.execute(
+                    """
+                    SELECT id, old_status, new_status, note, changed_at
+                    FROM application_events
+                    WHERE application_id = ?
+                    ORDER BY changed_at, id
+                    """,
+                    (application["id"],),
+                ).fetchall()
+        return {
+            "job": dict(job),
+            "postings": postings,
+            "requirements": requirements,
+            "application": dict(application) if application else None,
+            "application_events": [dict(event) for event in events],
+        }
 
     def get_run(self, run_id: int) -> dict:
         with self.connect() as connection:

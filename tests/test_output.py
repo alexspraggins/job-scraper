@@ -5,7 +5,13 @@ import re
 import pytest
 
 from job_scraper import config
-from job_scraper.output import EXPORT_COLUMNS, export_all, write_csv
+from job_scraper.output import (
+    APPLICATION_EXPORT_COLUMNS,
+    EXPORT_COLUMNS,
+    export_all,
+    export_application_pipeline,
+    write_csv,
+)
 from job_scraper.queueing import EnrichmentQueue
 from job_scraper.storage import JobStore
 
@@ -43,12 +49,41 @@ def test_exports_current_and_per_run_csv_without_separator_rows(tmp_path):
         rows = list(csv.DictReader(csv_file))
     assert list(rows[0]) == EXPORT_COLUMNS
     assert EXPORT_COLUMNS[:6] == [
-        "id", "status", "title", "preferred_url", "company", "location",
+        "id", "title", "preferred_url", "company", "location", "is_remote",
     ]
     assert len(rows) == 1
     assert rows[0]["title"] == "Junior Backend Engineer"
     assert rows[0]["compensation"] == "USD 90000-110000/yearly"
     assert "Jobs Scraped at" not in current_path.read_text()
+
+
+def test_application_pipeline_export_is_historical_and_separate(tmp_path):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job_id, _ = store.upsert_job(
+        {
+            "id": "application-1",
+            "site": "indeed",
+            "job_url": "https://example.com/application-1",
+            "title": "Software Engineer",
+            "company": "Example",
+            "location": "Remote",
+            "role_family": "core_software",
+            "seniority": "entry",
+            "matched_terms": ["software engineer"],
+            "date_posted": "2020-01-01T00:00:00+00:00",
+        },
+        query_group="core_software",
+        search_term="software engineer",
+    )
+    store.create_application(job_id, "Applied years ago")
+    path = export_application_pipeline(store, tmp_path / "exports")
+
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    assert path.name == "application-pipeline.csv"
+    assert list(rows[0]) == APPLICATION_EXPORT_COLUMNS
+    assert rows[0]["id"] == str(job_id)
+    assert rows[0]["application_status"] == "applied"
 
 
 def test_empty_new_job_ids_do_not_create_run_export(tmp_path):

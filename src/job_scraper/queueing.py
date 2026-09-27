@@ -204,13 +204,13 @@ class EnrichmentQueue:
         counts = {"fetch_created": 0, "analysis_created": 0, "cancelled": 0}
         with self.store.connect() as connection:
             posting = connection.execute(
-                """SELECT p.*, j.eligible, j.status AS job_status
+                """SELECT p.*, j.eligible
                    FROM postings p JOIN jobs j ON j.id=p.job_id WHERE p.id=?""",
                 (posting_id,),
             ).fetchone()
             if posting is None:
                 return counts
-            if not posting["eligible"] or posting["job_status"] == "rejected":
+            if not posting["eligible"]:
                 cursor = connection.execute(
                     """UPDATE enrichment_tasks SET status='cancelled', updated_at=?,
                        lease_token=NULL, lease_expires_at=NULL
@@ -278,7 +278,7 @@ class EnrichmentQueue:
         with self.store.connect() as connection:
             ids = [r[0] for r in connection.execute(
                 """SELECT p.id FROM postings p JOIN jobs j ON j.id=p.job_id
-                   WHERE j.eligible=1 AND j.status!='rejected'"""
+                   WHERE j.eligible=1"""
             )]
         for posting_id in ids:
             result = self.sync_posting(posting_id)
@@ -296,7 +296,7 @@ class EnrichmentQueue:
                 row[0] for row in connection.execute(
                     """SELECT p.id
                        FROM postings p JOIN jobs j ON j.id=p.job_id
-                       WHERE j.eligible=1 AND j.status!='rejected'
+                       WHERE j.eligible=1
                          AND TRIM(COALESCE(p.description,''))!=''
                          AND NOT EXISTS (
                              SELECT 1 FROM posting_analyses a
@@ -324,7 +324,7 @@ class EnrichmentQueue:
                 row[0] for row in connection.execute(
                     """SELECT p.id
                        FROM postings p JOIN jobs j ON j.id=p.job_id
-                       WHERE j.eligible=1 AND j.status!='rejected'
+                       WHERE j.eligible=1
                          AND p.source='linkedin'
                          AND TRIM(COALESCE(p.description,''))=''
                          AND TRIM(COALESCE(NULLIF(p.job_url,''),

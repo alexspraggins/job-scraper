@@ -54,7 +54,7 @@ The per-run CSV is created only when new canonical jobs are found. To inspect
 the stored jobs:
 
 ```bash
-uv run job-scraper list --status new --limit 25
+uv run job-scraper list --limit 25
 uv run job-scraper show JOB_ID
 ```
 
@@ -119,20 +119,22 @@ and CSV export, but does not fetch descriptions or call OpenAI. Use
 written to `data/exports/current-jobs.csv`; queued enrichment can be processed
 later with `uv run job-scraper enrich`.
 
-### Review and update jobs
+### Track applications
 
 ```bash
-uv run job-scraper list --status new --limit 25
-uv run job-scraper show JOB_ID
-uv run job-scraper status JOB_ID reviewed
-uv run job-scraper status JOB_ID saved --note "Strong backend fit"
-uv run job-scraper status JOB_ID applied --note "Applied on company site"
-uv run job-scraper status JOB_ID rejected --note "Requires too much experience"
+uv run job-scraper list --limit 25
+uv run job-scraper application create JOB_ID --note "Applied on company site"
+uv run job-scraper application status JOB_ID interviewing --note "Phone screen scheduled"
+uv run job-scraper application status JOB_ID offer --note "Offer received"
+uv run job-scraper application show JOB_ID
+uv run job-scraper application list --status interviewing
+uv run job-scraper pipeline
 ```
 
-Supported statuses are `new`, `reviewed`, `saved`, `applied`, and `rejected`.
-Status changes preserve the job record and are recorded in SQLite history.
-Rejecting a job cancels unfinished enrichment tasks for that job.
+`application create` makes one application for a job at the `applied` stage.
+Later lifecycle changes use `application status`. Supported application stages
+are `applied`, `interviewing`, `offer`, `accepted`, `rejected`, and `withdrawn`.
+Every transition is recorded in SQLite application history.
 
 ### Regenerate exports
 
@@ -330,19 +332,23 @@ uv run job-scraper run [--once] [--lookback-hours HOURS] [--no-enrichment] [--ve
 ### `list`
 
 ```bash
-uv run job-scraper list [--status STATUS] [--limit NUMBER]
+uv run job-scraper list [--limit NUMBER]
 ```
 
-`--status` accepts `new`, `reviewed`, `saved`, `applied`, or `rejected`.
-`--limit` defaults to 50.
+Lists discovered jobs. `--limit` defaults to 50.
 
-### `status`
+### `application`
 
 ```bash
-uv run job-scraper status JOB_ID STATUS [--note TEXT]
+uv run job-scraper application create JOB_ID [--note TEXT]
+uv run job-scraper application status JOB_ID STATUS [--note TEXT]
+uv run job-scraper application list [--status STATUS] [--limit NUMBER]
+uv run job-scraper application show JOB_ID
 ```
 
-Requires one numeric `JOB_ID` and one supported status.
+Applications are one-to-one with canonical jobs. `create` is idempotent and
+starts at `applied`; `status` requires an existing application and appends an
+event with its UTC timestamp.
 
 ### `export`
 
@@ -351,6 +357,15 @@ uv run job-scraper export
 ```
 
 Regenerates the consolidated CSV without scraping.
+
+### `pipeline`
+
+```bash
+uv run job-scraper pipeline
+```
+
+Writes the historical application-only export to
+`data/exports/application-pipeline.csv`.
 
 ### `queue`
 
@@ -501,10 +516,15 @@ SQLite is stored at:
 data/jobs.sqlite3
 ```
 
+When an existing pre-application database is opened for the first time, the
+application migration creates a one-time sibling backup named
+`jobs.sqlite3.pre-application-migration.bak` before removing legacy workflow
+columns.
+
 Conceptually, the database contains:
 
-- canonical jobs and user workflow statuses
-- source-specific postings and descriptions
+- canonical jobs and source-specific postings
+- applications and append-only application event history
 - scrape runs and per-source attempts
 - enrichment tasks and task event history
 - versioned posting analyses and extracted requirements
@@ -520,18 +540,22 @@ Identifiers have different scopes:
 
 ```text
 data/exports/current-jobs.csv
+data/exports/application-pipeline.csv
 data/exports/runs/new-jobs-YYYY-MM-DD-HH-MM-SS.csv
 ```
 
 `current-jobs.csv` is the consolidated eligible-job view. Per-run CSV files
 contain only new canonical jobs from that run. Exported enrichment columns
 include `required_skills`, `preferred_skills`, `experience`, and
-`analysis_status`. The status is the most conservative state across every
-stored posting, using `dead`, `unavailable`, `not_queued`, `budget_blocked`,
-`retry`, `pending`, or `completed`. Use `show JOB_ID` for source-level task and
-error details. The first columns are `id`, `status`, `title`, `preferred_url`,
-`company`, and `location`, so the preferred job link follows the title directly.
-Long descriptions and evidence remain in SQLite so the CSV stays compact.
+`analysis_status`. The analysis status is the most conservative state across
+every stored posting, using `dead`, `unavailable`, `not_queued`,
+`budget_blocked`, `retry`, `pending`, or `completed`. Use `show JOB_ID` for
+source-level task and error details. Long descriptions and evidence remain in
+SQLite so the CSV stays compact.
+
+`application-pipeline.csv` contains only jobs with application records. It is
+historical rather than freshness-filtered and includes application stage,
+first-entry dates, notes, and job links.
 
 `current-jobs.csv` is a rolling 24-hour view. Jobs are included when their
 precise `date_posted` timestamp is within the last 24 hours; missing, date-only,
@@ -571,9 +595,9 @@ Focused suites:
 The focused modules are organized by test boundary: CLI parsing, configuration,
 filtering, and source normalization are unit coverage; pipeline, storage,
 enrichment, and export behavior are integration coverage; `test_system.py`
-exercises the CLI in a separate Python process across listing, status updates,
-showing, and export. The system test uses a temporary database and does not
-contact live job sites.
+exercises the CLI in a separate Python process across listing, application
+creation and transitions, showing, and export. The system test uses a
+temporary database and does not contact live job sites.
 
 The suite uses temporary databases and mocked network/LLM calls, so it is the
 preferred feedback loop for code changes.

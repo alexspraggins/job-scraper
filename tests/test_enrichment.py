@@ -404,16 +404,15 @@ def test_budget_blocks_without_consuming_attempt(tmp_path, monkeypatch):
     assert task["attempt_count"] == 0
 
 
-def test_rejected_job_cancels_unfinished_tasks(tmp_path):
+def test_application_rejection_does_not_change_enrichment_tasks(tmp_path):
     store = JobStore(tmp_path / "jobs.sqlite3")
     queue = EnrichmentQueue(store)
     job_id = add_posting(store, description="Python is required.")
     queue.sync_job(job_id)
-    store.set_status(job_id, "rejected")
-    assert queue.list_tasks("cancelled")
-    store.set_status(job_id, "saved")
-    queue.sync_job(job_id)
+    store.create_application(job_id)
+    store.set_application_status(job_id, "rejected")
     assert queue.list_tasks("pending")
+    assert not queue.list_tasks("cancelled")
 
 
 def test_expired_lease_is_counted_and_recovered_as_retry(tmp_path):
