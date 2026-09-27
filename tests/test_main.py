@@ -312,37 +312,23 @@ def test_default_searches_have_fifteen_representatives_across_all_families():
     assert len(config.SEARCH_GROUPS) == 9
     assert sum(map(len, config.SEARCH_GROUPS.values())) == 15
     assert set(config.SEARCH_GROUPS) == set(config.ROLE_TERMS)
-    assert config.SOURCES == ["indeed", "linkedin", "glassdoor"]
+    assert config.SOURCES == ["indeed", "linkedin"]
 
 
-def test_glassdoor_results_use_the_normal_pipeline(tmp_path):
-    def fake_scraper(**kwargs):
-        assert kwargs["site_name"] == ["glassdoor"]
-        return pd.DataFrame([{
-            "id": "glassdoor-1",
-            "site": "glassdoor",
-            "job_url": "https://example.com/glassdoor-1",
-            "title": "Junior Software Engineer",
-            "company": "Example",
-            "location": "Remote",
-        }])
-
+def test_glassdoor_is_rejected_before_scraping(tmp_path):
     store = JobStore(tmp_path / "jobs.sqlite3")
-    summary = run_scrape_cycle(
-        store,
-        24,
-        search_groups={"core_software": ["software engineer"]},
-        sources=["glassdoor"],
-        scraper=fake_scraper,
-        query_delay_seconds=0,
-        source_timeout_seconds=0,
-        export_dir=tmp_path / "exports",
-        process_queues=False,
-    )
-
-    assert summary.errors == ()
-    assert len(summary.new_job_ids) == 1
-    assert store.get_job_details(summary.new_job_ids[0])["postings"][0]["source"] == "glassdoor"
+    with pytest.raises(ValueError, match="Unsupported source.*glassdoor"):
+        run_scrape_cycle(
+            store,
+            24,
+            search_groups={"core_software": ["software engineer"]},
+            sources=["glassdoor"],
+            scraper=lambda **_kwargs: pytest.fail("Glassdoor was invoked"),
+            query_delay_seconds=0,
+            source_timeout_seconds=0,
+            export_dir=tmp_path / "exports",
+            process_queues=False,
+        )
 
 
 def empty_cycle_options(tmp_path):
