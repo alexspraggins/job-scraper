@@ -54,19 +54,28 @@ def test_cli_process_boundary_supports_review_and_export_workflow(tmp_path):
     job_id = seed_job(database)
     base = ("--database", str(database), "--output-dir", str(exports))
 
-    listed = run_cli(*base, "list", "--status", "new")
+    listed = run_cli(*base, "list")
     assert listed.returncode == 0
     assert f"{job_id:>5}" in listed.stdout
     assert "Junior Software Engineer" in listed.stdout
 
-    status = run_cli(*base, "status", str(job_id), "saved", "--note", "Good fit")
-    assert status.returncode == 0
-    assert "marked saved" in status.stdout
+    created = run_cli(
+        *base, "application", "create", str(job_id), "--note", "Applied"
+    )
+    assert created.returncode == 0
+    assert "Application created" in created.stdout
 
-    shown = run_cli(*base, "show", str(job_id))
+    status = run_cli(
+        *base, "application", "status", str(job_id), "interviewing",
+        "--note", "Good fit",
+    )
+    assert status.returncode == 0
+    assert "marked interviewing" in status.stdout
+
+    shown = run_cli(*base, "application", "show", str(job_id))
     assert shown.returncode == 0
     assert f"Job {job_id}: Junior Software Engineer" in shown.stdout
-    assert "Status: saved" in shown.stdout
+    assert "Application: interviewing" in shown.stdout
 
     exported = run_cli(*base, "export")
     assert exported.returncode == 0
@@ -75,4 +84,13 @@ def test_cli_process_boundary_supports_review_and_export_workflow(tmp_path):
         rows = list(csv.DictReader(csv_file))
     assert len(rows) == 1
     assert rows[0]["id"] == str(job_id)
-    assert rows[0]["status"] == "saved"
+
+    pipeline = run_cli(*base, "pipeline")
+    assert pipeline.returncode == 0
+    with (exports / "application-pipeline.csv").open(
+        newline="", encoding="utf-8"
+    ) as csv_file:
+        pipeline_rows = list(csv.DictReader(csv_file))
+    assert len(pipeline_rows) == 1
+    assert pipeline_rows[0]["id"] == str(job_id)
+    assert pipeline_rows[0]["application_status"] == "interviewing"

@@ -12,7 +12,7 @@ from typing import Sequence
 from . import config
 from .emailer import send_email
 from .enrichment import process_enrichment
-from .output import export_all
+from .output import export_all, export_application_pipeline
 from .pipeline import (
     RunSummary,
     _configure_verbose_logging,
@@ -20,7 +20,7 @@ from .pipeline import (
 )
 from .queueing import EnrichmentQueue, TASK_STATUSES
 from .sources import scrape_source_with_timeout as _scrape_source_with_timeout
-from .storage import JobStore, VALID_STATUSES
+from .storage import APPLICATION_STATUSES, JobStore
 
 
 def _positive_int(value: str) -> int:
@@ -135,26 +135,72 @@ def run_command(args: argparse.Namespace) -> int:
 
 def list_command(args: argparse.Namespace) -> int:
     store = JobStore(args.database)
-    jobs = store.list_jobs(args.status, args.limit)
+    jobs = store.list_jobs(args.limit)
     if not jobs:
         print("No jobs found.")
         return 0
-    print(f"{'ID':>5}  {'STATUS':<9}  {'TITLE':<45}  COMPANY")
+    print(f"{'ID':>5}  {'TITLE':<45}  COMPANY")
     for job in jobs:
         title = (job["title"] or "")[:45]
         company = job["company"] or ""
-        print(f"{job['id']:>5}  {job['status']:<9}  {title:<45}  {company}")
+        print(f"{job['id']:>5}  {title:<45}  {company}")
     return 0
 
 
-def status_command(args: argparse.Namespace) -> int:
+def application_create_command(args: argparse.Namespace) -> int:
     store = JobStore(args.database)
     try:
-        store.set_status(args.job_id, args.new_status, args.note)
+        application, created = store.create_application(args.job_id, args.note)
+    except KeyError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if created:
+        print(f"Application created for job {args.job_id} at applied.")
+    else:
+        print(
+            f"Application already exists for job {args.job_id} "
+            f"(status: {application['status']})."
+        )
+    return 0
+
+
+def application_status_command(args: argparse.Namespace) -> int:
+    store = JobStore(args.database)
+    try:
+        application = store.set_application_status(
+            args.job_id, args.application_status, args.note
+        )
     except (KeyError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2
-    print(f"Job {args.job_id} marked {args.new_status}.")
+    print(
+        f"Application for job {args.job_id} marked "
+        f"{application['status']}."
+    )
+    return 0
+
+
+def application_list_command(args: argparse.Namespace) -> int:
+    store = JobStore(args.database)
+    applications = store.list_applications(args.application_status, args.limit)
+    if not applications:
+        print("No applications found.")
+        return 0
+    print(f"{'JOB':>5}  {'STATUS':<12} {'TITLE':<45}  COMPANY")
+    for application in applications:
+        title = (application["title"] or "")[:45]
+        company = application["company"] or ""
+        print(
+            f"{application['job_id']:>5}  {application['status']:<12} "
+            f"{title:<45}  {company}"
+        )
+    return 0
+
+
+def pipeline_command(args: argparse.Namespace) -> int:
+    store = JobStore(args.database)
+    path = export_application_pipeline(store, args.output_dir)
+    print(f"Exported application pipeline to {path}")
     return 0
 
 
@@ -254,7 +300,25 @@ def show_command(args: argparse.Namespace) -> int:
         return 2
     job = details["job"]
     print(f"Job {job['id']}: {job['title']} — {job['company'] or ''}")
-    print(f"Status: {job['status']}  Location: {job['location'] or ''}")
+    print(f"Location: {job['location'] or ''}")
+    application = details["application"]
+    if application is None:
+        print("Application: not created")
+    else:
+        print(f"Application: {application['status']}")
+        if application["notes"]:
+            print(f"Application note: {application['notes']}")
+        for stage in APPLICATION_STATUSES:
+            timestamp = application[f"{stage}_at"]
+            if timestamp:
+                print(f"  {stage}: {timestamp}")
+        for event in details["application_events"]:
+            old_status = event["old_status"] or "none"
+            note = f" — {event['note']}" if event["note"] else ""
+            print(
+                f"  Event: {old_status} -> {event['new_status']} "
+                f"at {event['changed_at']}{note}"
+            )
     for posting in details["postings"]:
         description = posting["description_source"] or (
             "stored" if posting["description_available"] else "unavailable"
@@ -338,18 +402,55 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(handler=run_command)
 
     list_parser = subparsers.add_parser("list", help="List stored jobs")
-    list_parser.add_argument("--status", choices=VALID_STATUSES)
     list_parser.add_argument("--limit", type=int, default=50)
     list_parser.set_defaults(handler=list_command)
 
-    status_parser = subparsers.add_parser("status", help="Update a job status")
-    status_parser.add_argument("job_id", type=int)
-    status_parser.add_argument("new_status", choices=VALID_STATUSES)
-    status_parser.add_argument("--note")
-    status_parser.set_defaults(handler=status_command)
+    application_parser = subparsers.add_parser(
+        "application", help="Track application lifecycle"
+    )
+    application_subparsers = application_parser.add_subparsers(
+        dest="application_command", required=True
+    )
+
+    application_create_parser = application_subparsers.add_parser(
+        "create", help="Create an application for a job"
+    )
+    application_create_parser.add_argument("job_id", type=int)
+    application_create_parser.add_argument("--note")
+    application_create_parser.set_defaults(handler=application_create_command)
+
+    application_status_parser = application_subparsers.add_parser(
+        "status", help="Change an application status"
+    )
+    application_status_parser.add_argument("job_id", type=int)
+    application_status_parser.add_argument(
+        "application_status", choices=APPLICATION_STATUSES
+    )
+    application_status_parser.add_argument("--note")
+    application_status_parser.set_defaults(handler=application_status_command)
+
+    application_list_parser = application_subparsers.add_parser(
+        "list", help="List applications"
+    )
+    application_list_parser.add_argument(
+        "--status", dest="application_status", choices=APPLICATION_STATUSES
+    )
+    application_list_parser.add_argument("--limit", type=int, default=50)
+    application_list_parser.set_defaults(handler=application_list_command)
+
+    application_show_parser = application_subparsers.add_parser(
+        "show", help="Show application details and history"
+    )
+    application_show_parser.add_argument("job_id", type=int)
+    application_show_parser.set_defaults(handler=show_command)
 
     export_parser = subparsers.add_parser("export", help="Regenerate the current CSV")
     export_parser.set_defaults(handler=export_command)
+
+    pipeline_parser = subparsers.add_parser(
+        "pipeline", help="Export the application pipeline CSV"
+    )
+    pipeline_parser.set_defaults(handler=pipeline_command)
 
     queue_parser = subparsers.add_parser("queue", help="Inspect enrichment tasks")
     queue_parser.add_argument("--status", choices=TASK_STATUSES)

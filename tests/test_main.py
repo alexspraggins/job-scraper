@@ -167,7 +167,7 @@ def test_repeated_cycle_creates_no_duplicate_canonical_job(tmp_path):
     assert second.duplicate_count == 1
 
 
-def test_cli_status_list_and_export(tmp_path, capsys):
+def test_cli_application_list_and_pipeline_export(tmp_path, capsys):
     database = tmp_path / "jobs.sqlite3"
     exports = tmp_path / "exports"
     store = JobStore(database)
@@ -188,13 +188,51 @@ def test_cli_status_list_and_export(tmp_path, capsys):
     )
 
     base = ["--database", str(database), "--output-dir", str(exports)]
-    assert main([*base, "status", str(job_id), "saved", "--note", "Strong fit"]) == 0
-    assert main([*base, "list", "--status", "saved"]) == 0
+    assert main([*base, "application", "create", str(job_id), "--note", "Applied"]) == 0
+    assert main([
+        *base, "application", "status", str(job_id), "interviewing",
+        "--note", "Strong fit",
+    ]) == 0
+    assert main([*base, "list"]) == 0
+    assert main([*base, "application", "list", "--status", "interviewing"]) == 0
     assert main([*base, "export"]) == 0
+    assert main([*base, "pipeline"]) == 0
     output = capsys.readouterr().out
-    assert "marked saved" in output
+    assert "Application created" in output
+    assert "marked interviewing" in output
     assert "Software Engineer I" in output
     assert (exports / "current-jobs.csv").exists()
+    assert (exports / "application-pipeline.csv").exists()
+
+
+def test_application_cli_reports_missing_job_and_application(tmp_path, capsys):
+    database = tmp_path / "jobs.sqlite3"
+    assert main([
+        "--database", str(database), "application", "create", "999"
+    ]) == 2
+    assert "Job 999 was not found" in capsys.readouterr().err
+
+    store = JobStore(database)
+    job_id, _ = store.upsert_job(
+        {
+            "id": "not-applied",
+            "site": "indeed",
+            "job_url": "https://example.com/not-applied",
+            "title": "Software Engineer I",
+            "company": "Example",
+            "location": "Remote",
+            "role_family": "core_software",
+            "seniority": "entry",
+            "matched_terms": ["software engineer"],
+        },
+        query_group="core_software",
+        search_term="software engineer",
+    )
+    assert main([
+        "--database", str(database), "application", "status", str(job_id),
+        "interviewing",
+    ]) == 2
+    assert "Application for job" in capsys.readouterr().err
 
 
 def slow_scraper(**kwargs):

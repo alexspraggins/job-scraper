@@ -41,15 +41,27 @@ def test_parser_treats_enrichment_flags_as_aliases(flag):
 
 
 def test_parser_supports_review_queue_retry_enrichment_and_usage_options():
-    listing = parse("list", "--status", "saved", "--limit", "12")
-    assert listing.status == "saved"
+    listing = parse("list", "--limit", "12")
     assert listing.limit == 12
     assert listing.handler is main_module.list_command
 
-    status = parse("status", "42", "applied", "--note", "Follow up")
-    assert status.job_id == 42
-    assert status.new_status == "applied"
-    assert status.note == "Follow up"
+    application_create = parse("application", "create", "42", "--note", "Follow up")
+    assert application_create.job_id == 42
+    assert application_create.note == "Follow up"
+    assert application_create.handler is main_module.application_create_command
+
+    application_status = parse(
+        "application", "status", "42", "interviewing", "--note", "Phone screen"
+    )
+    assert application_status.job_id == 42
+    assert application_status.application_status == "interviewing"
+    assert application_status.note == "Phone screen"
+    assert application_status.handler is main_module.application_status_command
+
+    application_list = parse("application", "list", "--status", "interviewing", "--limit", "12")
+    assert application_list.application_status == "interviewing"
+    assert application_list.limit == 12
+    assert application_list.handler is main_module.application_list_command
 
     queue = parse("queue", "--status", "pending", "--limit", "3")
     assert queue.status == "pending"
@@ -91,9 +103,9 @@ def test_parser_supports_review_queue_retry_enrichment_and_usage_options():
 @pytest.mark.parametrize(
     "arguments",
     [
-        ("list", "--status", "not-a-status"),
         ("queue", "--status", "not-a-task-status"),
-        ("status", "42", "not-a-status"),
+        ("application", "status", "42", "not-an-application-status"),
+        ("status", "42", "applied"),
     ],
 )
 def test_parser_rejects_invalid_choice_values(arguments):

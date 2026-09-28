@@ -11,7 +11,6 @@ from .storage import JobStore
 
 EXPORT_COLUMNS = [
     "id",
-    "status",
     "title",
     "preferred_url",
     "company",
@@ -29,7 +28,26 @@ EXPORT_COLUMNS = [
     "preferred_skills",
     "experience",
     "analysis_status",
-    "notes",
+]
+APPLICATION_EXPORT_COLUMNS = [
+    "id",
+    "application_id",
+    "application_status",
+    "title",
+    "preferred_url",
+    "company",
+    "location",
+    "date_posted",
+    "first_seen_at",
+    "sources",
+    "applied_at",
+    "interviewing_at",
+    "offer_at",
+    "accepted_at",
+    "rejected_at",
+    "withdrawn_at",
+    "application_notes",
+    "application_updated_at",
 ]
 CURRENT_JOBS_LOOKBACK = timedelta(hours=24)
 
@@ -49,18 +67,23 @@ def _compensation(row: dict) -> str:
     return f"{currency} {amount}{suffix}".strip()
 
 
-def _prepare_rows(rows: list[dict]) -> list[dict]:
+def _prepare_rows(rows: list[dict], columns: list[str]) -> list[dict]:
     prepared = []
     for source_row in rows:
         row = dict(source_row)
         remote = row.get("is_remote")
         row["is_remote"] = "" if remote is None else ("yes" if remote else "no")
         row["compensation"] = _compensation(row)
-        prepared.append({column: row.get(column, "") or "" for column in EXPORT_COLUMNS})
+        prepared.append({column: row.get(column, "") or "" for column in columns})
     return prepared
 
 
-def write_csv(path: str | Path, rows: list[dict]) -> Path:
+def write_csv(
+    path: str | Path,
+    rows: list[dict],
+    *,
+    columns: list[str] = EXPORT_COLUMNS,
+) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -70,9 +93,9 @@ def write_csv(path: str | Path, rows: list[dict]) -> Path:
             prefix=f".{target.name}.", suffix=".tmp", delete=False,
         ) as csv_file:
             temporary_path = Path(csv_file.name)
-            writer = csv.DictWriter(csv_file, fieldnames=EXPORT_COLUMNS)
+            writer = csv.DictWriter(csv_file, fieldnames=columns)
             writer.writeheader()
-            writer.writerows(_prepare_rows(rows))
+            writer.writerows(_prepare_rows(rows, columns))
             csv_file.flush()
             os.fsync(csv_file.fileno())
         os.replace(temporary_path, target)
@@ -108,6 +131,17 @@ def export_new_jobs(
     timestamp = timestamp or datetime.now()
     path = Path(export_dir) / "runs" / f"new-jobs-{timestamp:%Y-%m-%d-%H-%M-%S}.csv"
     return write_csv(path, store.export_rows(job_ids))
+
+
+def export_application_pipeline(
+    store: JobStore,
+    export_dir: str | Path,
+) -> Path:
+    return write_csv(
+        Path(export_dir) / "application-pipeline.csv",
+        store.export_application_rows(),
+        columns=APPLICATION_EXPORT_COLUMNS,
+    )
 
 
 def export_all(
