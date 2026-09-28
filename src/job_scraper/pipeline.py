@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 import logging
@@ -219,48 +220,47 @@ def run_scrape_cycle(
                 )
 
     try:
-        parallel_indeed = "indeed" in sources and config.INDEED_MAX_WORKERS > 1
-        serial_sources = [
-            source for source in sources if source != "indeed" or not parallel_indeed
-        ]
-        indeed_futures: dict[tuple[str, str], Future[SourceResult]] = {}
+        worker_limits = {
+            "indeed": config.INDEED_MAX_WORKERS,
+            "linkedin": config.LINKEDIN_MAX_WORKERS,
+        }
+        futures: dict[tuple[int, int], Future[SourceResult]] = {}
+        unique_sources = list(dict.fromkeys(sources))
 
-        with ThreadPoolExecutor(
-            max_workers=config.INDEED_MAX_WORKERS,
-            thread_name_prefix="indeed-search",
-        ) as executor:
-            if parallel_indeed:
-                for query_group, search_term in terms:
-                    request = SourceRequest("indeed", search_term, lookback_hours)
-                    indeed_futures[(query_group, search_term)] = executor.submit(
+        # Fetch requests concurrently, but keep all SQLite writes in this
+        # coordinating thread. Results are consumed by query/source order so
+        # deduplication and exported output remain deterministic.
+        with ExitStack() as executor_stack:
+            executors = {
+                source: executor_stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=worker_limits.get(source, 1),
+                        thread_name_prefix=f"{source}-search",
+                    )
+                )
+                for source in unique_sources
+            }
+            linkedin_submitted = 0
+            for term_index, (query_group, search_term) in enumerate(terms):
+                for source_index, source in enumerate(sources):
+                    if source == "linkedin" and linkedin_submitted and delay:
+                        sleeper(delay)
+                    request = SourceRequest(source, search_term, lookback_hours)
+                    futures[(term_index, source_index)] = executors[source].submit(
                         run_source_attempt,
                         request,
                         scraper=scraper,
                         timeout_seconds=source_timeout,
                     )
+                    if source == "linkedin":
+                        linkedin_submitted += 1
 
-            # LinkedIn and future non-Indeed adapters remain in one serial lane
-            # so adding a source cannot increase their request rate.
-            for term_index, (query_group, search_term) in enumerate(terms):
-                for source in serial_sources:
-                    request = SourceRequest(source, search_term, lookback_hours)
+            for term_index, (query_group, _search_term) in enumerate(terms):
+                for source_index, _source in enumerate(sources):
                     store_attempt(
-                        run_source_attempt(
-                            request,
-                            scraper=scraper,
-                            timeout_seconds=source_timeout,
-                        ),
+                        futures[(term_index, source_index)].result(),
                         query_group,
                     )
-                if serial_sources and delay and term_index < len(terms) - 1:
-                    sleeper(delay)
-
-            # Consume Indeed results in deterministic query order even though
-            # the source requests ran concurrently.
-            for query_group, search_term in terms:
-                future = indeed_futures.get((query_group, search_term))
-                if future is not None:
-                    store_attempt(future.result(), query_group)
     except BaseException as error:
         finalize(
             "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
