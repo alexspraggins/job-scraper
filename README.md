@@ -98,7 +98,9 @@ uv run job-scraper run
 
 The first continuous cycle uses the 24-hour lookback. Later cycles run hourly
 with a two-hour overlapping lookback. Stop continuous mode with `Ctrl+C`.
-Indeed searches run in a small parallel pool; LinkedIn runs in a serial lane.
+Indeed and LinkedIn searches run in bounded per-source pools. Indeed defaults
+to three workers and LinkedIn to two workers. LinkedIn request starts remain
+staggered by the query delay to reduce request bursts.
 
 For a different one-time lookback:
 
@@ -437,7 +439,8 @@ not need email credentials unless email notifications are enabled.
 
 | Variable | Default | Description |
 |---|---:|---|
-| `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Concurrent Indeed search workers. LinkedIn remains serial. |
+| `JOB_SCRAPER_INDEED_MAX_WORKERS` | `3` | Maximum concurrent Indeed search workers. |
+| `JOB_SCRAPER_LINKEDIN_MAX_WORKERS` | `2` | Maximum concurrent LinkedIn search workers. Requests remain staggered by the query delay. |
 | `JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT` | `50` | Maximum LinkedIn fetches per automatic cycle. |
 
 ### OpenAI enrichment

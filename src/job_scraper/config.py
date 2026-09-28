@@ -245,9 +245,10 @@ INITIAL_LOOKBACK_HOURS = 24
 RECURRING_LOOKBACK_HOURS = 2
 QUERY_DELAY_SECONDS = 2
 SOURCE_TIMEOUT_SECONDS = 45
-# Indeed queries run in a small parallel pool while LinkedIn stays serial. This
-# overlaps Indeed without increasing LinkedIn's source request rate.
+# Indeed and LinkedIn queries run in bounded per-source pools. LinkedIn task
+# starts remain staggered by QUERY_DELAY_SECONDS to avoid request bursts.
 INDEED_MAX_WORKERS = max(1, _env_int("JOB_SCRAPER_INDEED_MAX_WORKERS", 3))
+LINKEDIN_MAX_WORKERS = max(1, _env_int("JOB_SCRAPER_LINKEDIN_MAX_WORKERS", 2))
 POLL_INTERVAL_SECONDS = 3600
 
 DATA_DIR = Path("data")

@@ -251,7 +251,7 @@ def test_source_timeout_terminates_stalled_worker():
         )
 
 
-def test_indeed_runs_concurrently_while_linkedin_stays_serial(tmp_path, monkeypatch):
+def test_indeed_and_linkedin_run_with_bounded_concurrency(tmp_path, monkeypatch):
     active = {"indeed": 0, "linkedin": 0}
     maximum = {"indeed": 0, "linkedin": 0}
     lock = threading.Lock()
@@ -267,6 +267,7 @@ def test_indeed_runs_concurrently_while_linkedin_stays_serial(tmp_path, monkeypa
         return pd.DataFrame()
 
     monkeypatch.setattr("job_scraper.config.INDEED_MAX_WORKERS", 3)
+    monkeypatch.setattr("job_scraper.config.LINKEDIN_MAX_WORKERS", 2)
     store = JobStore(tmp_path / "jobs.sqlite3")
     run_scrape_cycle(
         store,
@@ -281,7 +282,72 @@ def test_indeed_runs_concurrently_while_linkedin_stays_serial(tmp_path, monkeypa
     )
 
     assert maximum["indeed"] > 1
-    assert maximum["linkedin"] == 1
+    assert maximum["indeed"] == 3
+    assert maximum["linkedin"] == 2
+
+
+def test_concurrent_linkedin_requests_wait_for_all_results_and_keep_failures_isolated(tmp_path):
+    def fake_scraper(**kwargs):
+        term = kwargs["search_term"]
+        if term == "blocked":
+            raise RuntimeError("blocked")
+        return pd.DataFrame([{
+            "id": term,
+            "site": "linkedin",
+            "job_url": f"https://example.com/{term}",
+            "title": "Software Engineer",
+            "company": term,
+            "location": "Remote",
+        }])
+
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    summary = run_scrape_cycle(
+        store,
+        24,
+        search_groups={"core_software": ["first", "blocked", "third"]},
+        sources=["linkedin"],
+        scraper=fake_scraper,
+        query_delay_seconds=0,
+        source_timeout_seconds=0,
+        export_dir=tmp_path / "exports",
+        process_queues=False,
+    )
+
+    assert len(summary.errors) == 1
+    assert len(summary.new_job_ids) == 2
+    with store.connect() as connection:
+        attempts = connection.execute(
+            "SELECT COUNT(*) FROM scrape_attempts WHERE run_id = ?",
+            (summary.run_id,),
+        ).fetchone()[0]
+        jobs = connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert attempts == 3
+    assert jobs == 2
+
+
+def test_linkedin_request_starts_keep_the_configured_spacing(tmp_path):
+    delays = []
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    summary = run_scrape_cycle(
+        store,
+        24,
+        search_groups={"core_software": ["one", "two", "three"]},
+        sources=["linkedin"],
+        scraper=fast_scraper,
+        query_delay_seconds=2,
+        sleeper=delays.append,
+        source_timeout_seconds=0,
+        export_dir=tmp_path / "exports",
+        process_queues=False,
+    )
+
+    assert summary.errors == ()
+    assert delays == [2, 2]
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM scrape_attempts WHERE run_id = ?",
+            (summary.run_id,),
+        ).fetchone()[0] == 3
 
 
 def test_parallel_indeed_lane_works_with_process_timeouts(tmp_path, monkeypatch):

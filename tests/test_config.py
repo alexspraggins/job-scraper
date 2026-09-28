@@ -12,6 +12,7 @@ from job_scraper import config
 def reload_config(monkeypatch, *, dotenv_path=None, **values):
     for name in (
         "JOB_SCRAPER_INDEED_MAX_WORKERS",
+        "JOB_SCRAPER_LINKEDIN_MAX_WORKERS",
         "JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT",
         "JOB_SCRAPER_LLM_ENABLED",
         "JOB_SCRAPER_LLM_MODEL",
@@ -43,6 +44,7 @@ def test_configuration_uses_code_defaults_when_environment_is_empty(monkeypatch)
     loaded = reload_config(monkeypatch)
 
     assert loaded.INDEED_MAX_WORKERS == 3
+    assert loaded.LINKEDIN_MAX_WORKERS == 2
     assert loaded.LINKEDIN_DESCRIPTION_LIMIT == 50
     assert loaded.LLM_ENABLED is False
     assert loaded.LLM_MODEL == "gpt-5-nano"
@@ -60,6 +62,7 @@ def test_environment_values_override_code_defaults(monkeypatch):
     loaded = reload_config(
         monkeypatch,
         JOB_SCRAPER_INDEED_MAX_WORKERS="4",
+        JOB_SCRAPER_LINKEDIN_MAX_WORKERS="5",
         JOB_SCRAPER_LINKEDIN_DESCRIPTION_LIMIT="12",
         JOB_SCRAPER_LLM_ENABLED="yes",
         JOB_SCRAPER_LLM_MODEL="custom-model",
@@ -71,6 +74,7 @@ def test_environment_values_override_code_defaults(monkeypatch):
     )
 
     assert loaded.INDEED_MAX_WORKERS == 4
+    assert loaded.LINKEDIN_MAX_WORKERS == 5
     assert loaded.LINKEDIN_DESCRIPTION_LIMIT == 12
     assert loaded.LLM_ENABLED is True
     assert loaded.LLM_MODEL == "custom-model"
@@ -133,6 +137,11 @@ def test_blank_values_use_defaults_for_typed_settings(monkeypatch):
             "Invalid integer for JOB_SCRAPER_LLM_MAX_OUTPUT_TOKENS",
         ),
         (
+            "JOB_SCRAPER_LINKEDIN_MAX_WORKERS",
+            "many",
+            "Invalid integer for JOB_SCRAPER_LINKEDIN_MAX_WORKERS",
+        ),
+        (
             "JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD",
             "unlimited",
             "Invalid number for JOB_SCRAPER_LLM_MONTHLY_BUDGET_USD",
@@ -151,3 +160,4 @@ def test_config_module_exports_existing_public_settings(monkeypatch):
     assert hasattr(loaded, "LLM_ENABLED")
     assert hasattr(loaded, "LLM_MODEL")
     assert hasattr(loaded, "INDEED_MAX_WORKERS")
+    assert hasattr(loaded, "LINKEDIN_MAX_WORKERS")
