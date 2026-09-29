@@ -1,4 +1,6 @@
 import sqlite3
+from contextlib import closing
+import warnings
 
 import pytest
 
@@ -162,9 +164,20 @@ def test_new_schema_does_not_retain_legacy_job_workflow_columns(tmp_path):
     assert {"applications", "application_events"}.issubset(tables)
 
 
+def test_existing_database_initialization_closes_probe_connection(tmp_path):
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        JobStore(database)
+
+    assert not [warning for warning in caught if warning.category is ResourceWarning]
+
+
 def test_legacy_applied_job_is_backfilled_during_schema_migration(tmp_path):
     database = tmp_path / "legacy.sqlite3"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.executescript(
             """
             CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -211,6 +224,7 @@ def test_legacy_applied_job_is_backfilled_during_schema_migration(tmp_path):
             );
             """
         )
+        connection.commit()
 
     store = JobStore(database)
     application = store.get_application_details(1)["application"]
@@ -244,7 +258,7 @@ def test_application_pipeline_rows_include_only_tracked_jobs(tmp_path):
 
 def test_schema_version_is_recorded(tmp_path):
     store = JobStore(tmp_path / "jobs.sqlite3")
-    with sqlite3.connect(store.path) as connection:
+    with closing(sqlite3.connect(store.path)) as connection:
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]

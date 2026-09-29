@@ -115,6 +115,26 @@ def test_parser_rejects_invalid_choice_values(arguments):
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("run", "--lookback-hours", "0"),
+        ("run", "--lookback-hours", "-1"),
+        ("list", "--limit", "0"),
+        ("list", "--limit", "-1"),
+        ("application", "list", "--limit", "0"),
+        ("enrich", "--limit", "0"),
+        ("queue", "--limit", "-1"),
+        ("enrich", "--limit", "-1"),
+    ],
+)
+def test_parser_rejects_non_positive_numeric_options(arguments):
+    with pytest.raises(SystemExit) as error:
+        parse(*arguments)
+
+    assert error.value.code == 2
+
+
 def test_main_dispatches_run_options_without_starting_a_scrape(tmp_path, monkeypatch):
     captured = {}
 
