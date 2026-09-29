@@ -1,10 +1,11 @@
 import sqlite3
+from contextlib import closing
 
 from job_scraper.maintenance import backup_database, purge_source_data
 
 
 def seed_source_history(database):
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.executescript(
             """
             CREATE TABLE jobs (id INTEGER PRIMARY KEY);
@@ -33,6 +34,7 @@ def seed_source_history(database):
             INSERT INTO application_events VALUES (901, 801);
             """
         )
+        connection.commit()
 
 
 def test_backup_and_source_purge_preserve_mixed_source_jobs(tmp_path):
@@ -47,7 +49,7 @@ def test_backup_and_source_purge_preserve_mixed_source_jobs(tmp_path):
     assert summary.source_attempts == 1
     assert summary.deleted_jobs == 1
     assert summary.preserved_jobs == 1
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("SELECT id FROM jobs ORDER BY id").fetchall() == [(2,)]
         assert connection.execute("SELECT source FROM postings").fetchall() == [("indeed",)]
         assert connection.execute("SELECT source FROM scrape_attempts").fetchall() == [("indeed",)]

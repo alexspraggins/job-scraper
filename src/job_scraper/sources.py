@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import logging
 import multiprocessing
 from queue import Empty
+import threading
 import time
 from typing import Callable
 
@@ -44,7 +45,11 @@ class SourceResult:
 class _ErrorCapture(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.ERROR)
+        self.thread_id = threading.get_ident()
         self.messages: list[str] = []
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.thread == self.thread_id
 
     def emit(self, record: logging.LogRecord) -> None:
         message = record.getMessage()
@@ -130,13 +135,13 @@ def _scrape_source_with_timeout_result(
         target=_scrape_worker,
         args=(result_queue, source, search_term, lookback_hours, scraper),
     )
-    process.start()
+    started = False
     try:
+        process.start()
+        started = True
         result_type, payload = result_queue.get(timeout=timeout_seconds)
     except Empty as error:
         if process.is_alive():
-            process.terminate()
-            process.join(5)
             raise TimeoutError(
                 f"source request exceeded {timeout_seconds:g} seconds"
             ) from error
@@ -144,12 +149,15 @@ def _scrape_source_with_timeout_result(
             f"source worker exited without a result (exit code {process.exitcode})"
         ) from error
     finally:
+        if started and process.is_alive():
+            process.terminate()
+        if started:
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
         result_queue.close()
-
-    process.join(5)
-    if process.is_alive():
-        process.terminate()
-        process.join(5)
+        result_queue.join_thread()
 
     if result_type == "error":
         raise RuntimeError(payload)

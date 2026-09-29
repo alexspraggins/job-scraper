@@ -1,4 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import multiprocessing
+import time
 
 import pandas as pd
 import pytest
@@ -6,10 +9,15 @@ import pytest
 from job_scraper.sources import (
     JOBSPY_SOURCES,
     SourceRequest,
+    _scrape_source_with_timeout_result,
     run_source_attempt,
     scrape_source,
     validate_sources,
 )
+
+
+def empty_scraper(**_kwargs):
+    return pd.DataFrame()
 
 
 @pytest.mark.parametrize("source", ["indeed", "linkedin"])
@@ -78,3 +86,110 @@ def test_source_attempt_promotes_jobspy_error_logs():
 
     assert result.error == "DNS unavailable"
     assert result.jobs.empty
+
+
+def test_concurrent_no_timeout_error_capture_is_request_specific():
+    def logging_scraper(**kwargs):
+        term = kwargs["search_term"]
+        logging.getLogger("jobspy-test").error("error-for-%s", term)
+        time.sleep(0.05)
+        return pd.DataFrame()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda term: run_source_attempt(
+                SourceRequest("linkedin", term, 24),
+                scraper=logging_scraper,
+                timeout_seconds=0,
+            ),
+            ["one", "two"],
+        ))
+
+    assert [result.error for result in results] == [
+        "error-for-one",
+        "error-for-two",
+    ]
+
+
+def test_successful_timeout_worker_is_reaped():
+    before = {process.pid for process in multiprocessing.active_children()}
+    jobs, errors = _scrape_source_with_timeout_result(
+        "indeed",
+        "software engineer",
+        24,
+        empty_scraper,
+        5,
+    )
+
+    assert jobs.empty
+    assert errors == ()
+    assert not {
+        process.pid for process in multiprocessing.active_children()
+        if process.pid not in before
+    }
+
+
+def test_unexpected_worker_error_still_cleans_up(monkeypatch):
+    class FakeQueue:
+        def __init__(self):
+            self.closed = False
+            self.joined = False
+
+        def get(self, timeout):
+            raise OSError("queue failed")
+
+        def close(self):
+            self.closed = True
+
+        def join_thread(self):
+            self.joined = True
+
+    class FakeProcess:
+        instance = None
+
+        def __init__(self, **_kwargs):
+            self.alive = True
+            self.terminated = False
+            self.joined = False
+            FakeProcess.instance = self
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+        def join(self, _timeout):
+            self.joined = True
+
+    class FakeContext:
+        def Queue(self, **_kwargs):
+            queue = FakeQueue()
+            self.queue = queue
+            return queue
+
+        def Process(self, **kwargs):
+            return FakeProcess(**kwargs)
+
+    context = FakeContext()
+    monkeypatch.setattr(
+        "job_scraper.sources.multiprocessing.get_context",
+        lambda _method: context,
+    )
+
+    with pytest.raises(OSError, match="queue failed"):
+        _scrape_source_with_timeout_result(
+            "indeed", "software engineer", 24, empty_scraper, 5
+        )
+
+    assert FakeProcess.instance.terminated is True
+    assert FakeProcess.instance.joined is True
+    assert context.queue.closed is True
+    assert context.queue.joined is True

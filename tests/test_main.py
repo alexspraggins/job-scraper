@@ -1,4 +1,5 @@
 import logging
+import multiprocessing
 import threading
 import time
 from types import SimpleNamespace
@@ -245,10 +246,15 @@ def fast_scraper(**kwargs):
 
 
 def test_source_timeout_terminates_stalled_worker():
+    before = {process.pid for process in multiprocessing.active_children()}
     with pytest.raises(TimeoutError, match="exceeded"):
         _scrape_source_with_timeout(
             "indeed", "software engineer", 24, slow_scraper, 0.05
         )
+    assert not {
+        process.pid for process in multiprocessing.active_children()
+        if process.pid not in before
+    }
 
 
 def test_indeed_and_linkedin_run_with_bounded_concurrency(tmp_path, monkeypatch):
