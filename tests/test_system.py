@@ -38,6 +38,7 @@ def seed_job(database: Path) -> int:
             "title": "Junior Software Engineer",
             "company": "Example",
             "location": "Remote",
+            "is_remote": True,
             "role_family": "core_software",
             "seniority": "entry",
             "matched_terms": ["software engineer"],
@@ -83,7 +84,9 @@ def test_cli_process_boundary_supports_review_and_export_workflow(tmp_path):
     with current.open(newline="", encoding="utf-8") as csv_file:
         rows = list(csv.DictReader(csv_file))
     assert len(rows) == 1
-    assert rows[0]["id"] == str(job_id)
+    assert rows[0]["job_id"] == str(job_id)
+    assert rows[0]["role_family"] == "core_software"
+    assert rows[0]["is_remote"] == "yes"
 
     pipeline = run_cli(*base, "pipeline")
     assert pipeline.returncode == 0
@@ -92,5 +95,9 @@ def test_cli_process_boundary_supports_review_and_export_workflow(tmp_path):
     ) as csv_file:
         pipeline_rows = list(csv.DictReader(csv_file))
     assert len(pipeline_rows) == 1
-    assert pipeline_rows[0]["id"] == str(job_id)
+    assert pipeline_rows[0]["job_id"] == str(job_id)
     assert pipeline_rows[0]["application_status"] == "interviewing"
+    assert pipeline_rows[0]["role_family"] == "core_software"
+    assert pipeline_rows[0]["seniority"] == "entry"
+    assert pipeline_rows[0]["is_remote"] == "yes"
+    assert "last_seen_at" not in pipeline_rows[0]
