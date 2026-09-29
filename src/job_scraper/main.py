@@ -390,7 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run job searches")
     run_parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
-    run_parser.add_argument("--lookback-hours", type=int)
+    run_parser.add_argument("--lookback-hours", type=_positive_int)
     run_parser.add_argument(
         "--no-enrichment", "--skip-enrichment", dest="no_enrichment",
         action="store_true",
@@ -402,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(handler=run_command)
 
     list_parser = subparsers.add_parser("list", help="List stored jobs")
-    list_parser.add_argument("--limit", type=int, default=50)
+    list_parser.add_argument("--limit", type=_positive_int, default=50)
     list_parser.set_defaults(handler=list_command)
 
     application_parser = subparsers.add_parser(
@@ -435,7 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
     application_list_parser.add_argument(
         "--status", dest="application_status", choices=APPLICATION_STATUSES
     )
-    application_list_parser.add_argument("--limit", type=int, default=50)
+    application_list_parser.add_argument("--limit", type=_positive_int, default=50)
     application_list_parser.set_defaults(handler=application_list_command)
 
     application_show_parser = application_subparsers.add_parser(
@@ -454,7 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     queue_parser = subparsers.add_parser("queue", help="Inspect enrichment tasks")
     queue_parser.add_argument("--status", choices=TASK_STATUSES)
-    queue_parser.add_argument("--limit", type=int, default=50)
+    queue_parser.add_argument("--limit", type=_positive_int, default=50)
     queue_parser.set_defaults(handler=queue_command)
 
     retry_parser = subparsers.add_parser("retry", help="Retry dead enrichment tasks")
