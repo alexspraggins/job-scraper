@@ -562,8 +562,10 @@ source-level task and error details. Long descriptions and evidence remain in
 SQLite so the CSV stays compact.
 
 `application-pipeline.csv` contains only jobs with application records. It is
-historical rather than freshness-filtered and includes application stage,
-first-entry dates, notes, and job links.
+historical rather than freshness-filtered and includes explicit `job_id` and
+`application_id` columns, job classification fields, application stage,
+first-entry dates, notes, and job links. The discovery exports use `job_id` for
+the canonical job identifier; this replaces the previous generic `id` header.
 
 `current-jobs.csv` is a rolling 24-hour view. Jobs are included when their
 precise `date_posted` timestamp is within the last 24 hours; missing, date-only,

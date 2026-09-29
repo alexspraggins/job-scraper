@@ -48,13 +48,22 @@ def test_exports_current_and_per_run_csv_without_separator_rows(tmp_path):
     with current_path.open(newline="", encoding="utf-8") as csv_file:
         rows = list(csv.DictReader(csv_file))
     assert list(rows[0]) == EXPORT_COLUMNS
-    assert EXPORT_COLUMNS[:6] == [
-        "id", "title", "preferred_url", "company", "location", "is_remote",
+    assert EXPORT_COLUMNS == [
+        "job_id", "title", "role_family", "seniority", "company", "location",
+        "is_remote", "preferred_url", "sources", "date_posted", "first_seen_at",
+        "last_seen_at", "compensation", "matched_terms", "analysis_status",
+        "required_skills", "preferred_skills", "experience",
     ]
     assert len(rows) == 1
+    assert rows[0]["job_id"] == str(job_id)
     assert rows[0]["title"] == "Junior Backend Engineer"
     assert rows[0]["compensation"] == "USD 90000-110000/yearly"
     assert "Jobs Scraped at" not in current_path.read_text()
+
+    with run_path.open(newline="", encoding="utf-8") as csv_file:
+        run_rows = list(csv.DictReader(csv_file))
+    assert list(run_rows[0]) == EXPORT_COLUMNS
+    assert run_rows[0]["job_id"] == str(job_id)
 
 
 def test_application_pipeline_export_is_historical_and_separate(tmp_path):
@@ -67,6 +76,7 @@ def test_application_pipeline_export_is_historical_and_separate(tmp_path):
             "title": "Software Engineer",
             "company": "Example",
             "location": "Remote",
+            "is_remote": True,
             "role_family": "core_software",
             "seniority": "entry",
             "matched_terms": ["software engineer"],
@@ -82,8 +92,20 @@ def test_application_pipeline_export_is_historical_and_separate(tmp_path):
         rows = list(csv.DictReader(csv_file))
     assert path.name == "application-pipeline.csv"
     assert list(rows[0]) == APPLICATION_EXPORT_COLUMNS
-    assert rows[0]["id"] == str(job_id)
+    assert APPLICATION_EXPORT_COLUMNS == [
+        "job_id", "application_id", "application_status", "title", "role_family",
+        "seniority", "company", "location", "is_remote", "preferred_url", "sources",
+        "date_posted", "first_seen_at", "applied_at", "interviewing_at", "offer_at",
+        "accepted_at", "rejected_at", "withdrawn_at", "application_notes",
+        "application_updated_at",
+    ]
+    assert rows[0]["job_id"] == str(job_id)
+    assert rows[0]["application_id"]
     assert rows[0]["application_status"] == "applied"
+    assert rows[0]["role_family"] == "core_software"
+    assert rows[0]["seniority"] == "entry"
+    assert rows[0]["is_remote"] == "yes"
+    assert "last_seen_at" not in rows[0]
 
 
 def test_empty_new_job_ids_do_not_create_run_export(tmp_path):
@@ -193,9 +215,9 @@ def test_current_export_uses_hybrid_24_hour_freshness(tmp_path):
         current_time=now,
     )
     with current_path.open(newline="", encoding="utf-8") as csv_file:
-        current_ids = {int(row["id"]) for row in csv.DictReader(csv_file)}
+        current_ids = {int(row["job_id"]) for row in csv.DictReader(csv_file)}
     with new_path.open(newline="", encoding="utf-8") as csv_file:
-        new_ids = {int(row["id"]) for row in csv.DictReader(csv_file)}
+        new_ids = {int(row["job_id"]) for row in csv.DictReader(csv_file)}
 
     assert current_ids == {
         precise_recent,
@@ -210,7 +232,7 @@ def test_current_export_uses_hybrid_24_hour_freshness(tmp_path):
 
     assert precise_old in {row["id"] for row in store.list_jobs()}
     assert store.get_job_details(precise_old)["job"]["id"] == precise_old
-    assert precise_old in {row["id"] for row in store.export_rows()}
+    assert precise_old in {row["job_id"] for row in store.export_rows()}
 
 
 def add_posting(store, *, source, source_id, description=None):

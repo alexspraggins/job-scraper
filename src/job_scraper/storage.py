@@ -845,7 +845,7 @@ class JobStore:
 
         query = f"""
             SELECT
-                j.id, j.title, j.company, j.location, j.is_remote,
+                j.id AS job_id, j.title, j.company, j.location, j.is_remote,
                 j.role_family, j.seniority, j.date_posted, j.first_seen_at,
                 j.last_seen_at,
                 (SELECT group_concat(source, ', ')
@@ -868,11 +868,11 @@ class JobStore:
             if fresh_since is not None:
                 cutoff = _as_utc(fresh_since)
                 rows = [row for row in rows if _is_current_job(row, cutoff)]
-            selected_ids = [row["id"] for row in rows]
+            selected_ids = [row["job_id"] for row in rows]
             requirements_by_job = self._current_requirements(connection, selected_ids)
             postings_by_job = self._posting_states(connection, selected_ids)
             for row in rows:
-                requirements = requirements_by_job.get(row["id"], [])
+                requirements = requirements_by_job.get(row["job_id"], [])
                 grouped: dict[str, list[str]] = {}
                 for requirement in requirements:
                     key = requirement["requirement_type"]
@@ -887,7 +887,7 @@ class JobStore:
                     row[key] = "; ".join(grouped.get(key, []))
                 states = [
                     posting["analysis_status"]
-                    for posting in postings_by_job.get(row["id"], [])
+                    for posting in postings_by_job.get(row["job_id"], [])
                 ]
                 row["analysis_status"] = min(
                     states or ["unavailable"],
@@ -923,8 +923,10 @@ class JobStore:
         parameters: list[object] = []
         query = """
             SELECT
-                j.id, a.id application_id, a.status application_status,
-                j.title, j.company, j.location, j.date_posted, j.first_seen_at,
+                j.id AS job_id, a.id AS application_id,
+                a.status AS application_status,
+                j.title, j.role_family, j.seniority, j.company, j.location,
+                j.is_remote, j.date_posted, j.first_seen_at,
                 a.applied_at, a.interviewing_at, a.offer_at, a.accepted_at,
                 a.rejected_at, a.withdrawn_at, a.notes application_notes,
                 a.updated_at application_updated_at,

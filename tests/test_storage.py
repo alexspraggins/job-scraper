@@ -238,8 +238,8 @@ def test_application_pipeline_rows_include_only_tracked_jobs(tmp_path):
     )
     store.create_application(applied_id)
     rows = store.export_application_rows()
-    assert [row["id"] for row in rows] == [applied_id]
-    assert untracked_id not in [row["id"] for row in rows]
+    assert [row["job_id"] for row in rows] == [applied_id]
+    assert untracked_id not in [row["job_id"] for row in rows]
 
 
 def test_schema_version_is_recorded(tmp_path):
@@ -273,7 +273,7 @@ def test_reclassification_hides_ineligible_jobs_without_deleting_them(tmp_path):
     )
 
     eligible, ineligible = store.reclassify_jobs()
-    exported_ids = [row["id"] for row in store.export_rows()]
+    exported_ids = [row["job_id"] for row in store.export_rows()]
 
     assert (eligible, ineligible) == (1, 1)
     assert exported_ids == [eligible_id]
