@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -158,7 +158,7 @@ class JobStore:
         existing_database = self.path.exists() and self.path.stat().st_size > 0
         legacy_database = False
         if existing_database:
-            with sqlite3.connect(self.path) as probe:
+            with closing(sqlite3.connect(self.path)) as probe:
                 legacy_columns = {
                     row[1] for row in probe.execute("PRAGMA table_info(jobs)")
                 }
